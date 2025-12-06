@@ -22,10 +22,16 @@ def register():
     return "vllm_ascend.platform.NPUPlatform"
 
 
-def register_model():
-    # fix pytorch schema check error, remove this line after pytorch
-    # is upgraded to 2.7.0
-    import vllm_ascend.patch.worker.patch_common.patch_utils  # noqa: F401
+def register_connector():
+    from vllm_ascend.distributed import register_connector
+    register_connector()
 
-    from .models import register_model
-    register_model()
+
+def register_model_loader():
+    from .model_loader.netloader import register_netloader
+    register_netloader()
+
+
+def register_service_profiling():
+    from .profiling_config import generate_service_profiling_config
+    generate_service_profiling_config()

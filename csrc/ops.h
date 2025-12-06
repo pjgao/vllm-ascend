@@ -60,4 +60,111 @@ namespace vllm_ascend {
     auto new_tensor = at_npu::native::from_blob(data_ptr, sizes, strides, options);
     return new_tensor;
   }
+
+  extern void bgmv_shrink_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *weight,
+        void *indices,
+        uint32_t indicesSize,
+        void *y, 
+        uint32_t batch_size,
+        uint32_t num_tokens_per_core,
+        uint32_t input_hidden_dim,
+        uint32_t lora_rank,
+        float scale);
+
+    extern void bgmv_expand_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *weight,
+        void *indices,
+        uint32_t indicesSize,
+        void *y,
+        void *y_out,
+        uint32_t batch_size,
+        uint32_t num_tokens_per_core,
+        uint32_t lora_rank,
+        uint32_t output_hidden_dim,
+        uint32_t slice_offset,
+        uint32_t output_full_dim);
+
+    extern void sgmv_shrink_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *weight,
+        void *loraIndices,
+        uint32_t loraIndicesSize,
+        void *seqLen,
+        uint32_t seqLenSize,
+        void *y,
+        uint32_t batch_size,
+        uint32_t num_tokens_per_core,
+        uint32_t input_hidden_dim,
+        uint32_t lora_rank,
+        float scale);
+
+    extern void sgmv_expand_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *weight,
+        void *loraIndices,
+        uint32_t loraIndicesSize,
+        void *seqLen,
+        uint32_t seqLenSize,
+        void *y,
+        void *y_out,
+        uint32_t batch_size,
+        uint32_t num_tokens_per_core,
+        uint32_t lora_rank,
+        uint32_t output_hidden_dim,
+        uint32_t slice_offset,
+        uint32_t output_full_dim);
+
+    extern void mla_preprocess_impl(
+        void* stream,
+        void* hidden_state,
+        void* quant_scale1,
+        void* quant_offset1,
+        void* wdqkv,
+        void* bias1,
+        void* gamma2,
+        void* beta2,
+        void* quant_scale2,
+        void* quant_offset2,
+        void* gamma3,
+        void* sin1,
+        void* cos1,
+        void* sin2,
+        void* cos2,
+        void* keycache,
+        void* slot_mapping,
+        void* wuq,
+        void* bias2,
+        void* wuk,
+        void* descale1,
+        void* descale2,
+        void* ctkv_scale,
+        void* qnope_scale,
+        void* q,
+        void* keycache_out,
+        void* q2,
+        void* keycache_out2,
+        void* workspace,
+        void* tiling,
+        const uint32_t block_dim
+    );
+
+    extern void batch_matmul_transpose_impl(
+        void* stream,
+        void* gm_a,
+        void* gm_b,
+        void* gm_c,
+        void* gm_tiling_data,
+        const uint32_t block_dim
+    );
 }

@@ -20,9 +20,10 @@ from tests.e2e.conftest import VllmRunner
 
 MODELS = [
     "Qwen/Qwen3-0.6B",
+    "deepseek-ai/DeepSeek-V2-Lite-Chat",
 ]
 
-TENSOR_PARALLELS = [2]
+TENSOR_PARALLELS = [1]
 PIPELINE_PARALLELS = [2]
 DIST_EXECUTOR_BACKEND = ["mp", "ray"]
 
@@ -42,6 +43,5 @@ def test_models(model: str, tp_size: int, pp_size: int,
                     tensor_parallel_size=tp_size,
                     pipeline_parallel_size=pp_size,
                     distributed_executor_backend=distributed_executor_backend,
-                    enforce_eager=True,
                     gpu_memory_utilization=0.7) as vllm_model:
         vllm_model.generate_greedy(prompts, 64)

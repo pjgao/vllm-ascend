@@ -24,19 +24,24 @@ from vllm.config import (CompilationConfig, ModelConfig, ParallelConfig,
 
 from tests.ut.base import TestBase
 from vllm_ascend import utils
+from vllm_ascend.utils import REGISTERED_ASCEND_OPS
 
 
 class TestUtils(TestBase):
 
-    def test_is_310p(self):
-        utils._IS_310P = None
-        with mock.patch("vllm_ascend._build_info.__soc_version__",
-                        "Ascend310P3"):
-            self.assertTrue(utils.is_310p())
-        utils._IS_310P = None
-        with mock.patch("vllm_ascend._build_info.__soc_version__",
-                        "Ascend910P1"):
-            self.assertFalse(utils.is_310p())
+    def setUp(self):
+        import importlib
+
+        from vllm_ascend import platform
+        importlib.reload(platform)
+
+    def test_is_enable_nz(self):
+        with mock.patch("vllm_ascend.utils.envs_ascend.VLLM_ASCEND_ENABLE_NZ",
+                        1):
+            self.assertTrue(utils.is_enable_nz())
+        with mock.patch("vllm_ascend.utils.envs_ascend.VLLM_ASCEND_ENABLE_NZ",
+                        0):
+            self.assertFalse(utils.is_enable_nz())
 
     def test_sleep_mode_enabled(self):
         utils._SLEEP_MODE_ENABLED = None
@@ -116,79 +121,6 @@ class TestUtils(TestBase):
         input_tensor = torch.randn(17, 64)
         output_tensor = utils.aligned_16(input_tensor)
         self.assertEqual(output_tensor.shape[0], 32)
-
-    @mock.patch('torch_npu.get_npu_format')
-    @mock.patch('torch_npu.npu_format_cast')
-    @mock.patch('vllm.model_executor.layers.fused_moe.layer.FusedMoE',
-                new=mock.MagicMock)
-    @mock.patch('vllm_ascend.utils.is_310p')
-    @mock.patch('vllm_ascend.utils.get_ascend_config')
-    def test_maybe_converting_weight_acl_format(self, mock_get_config,
-                                                mock_310p, mock_npu_cast,
-                                                mock_get_format):
-        ACL_FORMAT_FRACTAL_NZ = 29
-        mock_310p.return_value = True
-
-        mock_config = mock.MagicMock()
-        mock_config.torchair_graph_config.enabled = True
-        mock_get_config.return_value = mock_config
-        mock_get_format.return_value = 1
-
-        mock_npu_cast.return_value = 1
-
-        fused_moe = mock.MagicMock()
-        fused_moe.w13_weight = mock.MagicMock()
-        fused_moe.w2_weight = mock.MagicMock()
-        fused_moe.w13_weight.data = torch.randn(128, 256)
-        fused_moe.w2_weight.data = torch.randn(256, 128)
-        model = mock.MagicMock()
-        model.modules.return_value = [fused_moe]
-
-        utils.maybe_converting_weight_acl_format(model, ACL_FORMAT_FRACTAL_NZ)
-        self.assertEqual(fused_moe.w13_weight.data, 1)
-
-    @mock.patch('torch_npu.get_npu_format')
-    @mock.patch('torch_npu.npu_format_cast')
-    @mock.patch('vllm.model_executor.layers.fused_moe.layer.FusedMoE',
-                new=mock.MagicMock)
-    @mock.patch('vllm_ascend.utils.is_310p')
-    @mock.patch('vllm_ascend.utils.get_ascend_config')
-    def test_maybe_converting_weight_acl_format_format_true(
-            self, mock_get_config, mock_310p, mock_npu_cast, mock_get_format):
-        ACL_FORMAT_FRACTAL_NZ = 29
-        mock_310p.return_value = True
-
-        mock_config = mock.MagicMock()
-        mock_config.torchair_graph_config.enabled = True
-        mock_get_config.return_value = mock_config
-        mock_get_format.return_value = ACL_FORMAT_FRACTAL_NZ
-
-        mock_npu_cast.return_value = 1
-
-        fused_moe = mock.MagicMock()
-        fused_moe.w13_weight = mock.MagicMock()
-        fused_moe.w2_weight = mock.MagicMock()
-        fused_moe.w13_weight.data = torch.randn(128, 256)
-        fused_moe.w2_weight.data = torch.randn(256, 128)
-        model = mock.MagicMock()
-        model.modules.return_value = [fused_moe]
-
-        mock_get_format.return_value = ACL_FORMAT_FRACTAL_NZ
-
-        utils.maybe_converting_weight_acl_format(model, ACL_FORMAT_FRACTAL_NZ)
-
-    @mock.patch('vllm_ascend.utils.get_ascend_config')
-    @mock.patch('vllm_ascend.utils.is_310p', return_value=False)
-    def test_maybe_converting_weight_acl_format_not_310_not_graph(
-            self, mock_310p, mock_get_config):
-        mock_config = mock.MagicMock()
-        mock_config.torchair_graph_config.enabled = False
-        mock_get_config.return_value = mock_config
-
-        mock_constant = mock.MagicMock()
-
-        mock_model = mock.MagicMock()
-        utils.maybe_converting_weight_acl_format(mock_model, mock_constant)
 
     @mock.patch('importlib.util.find_spec')
     @mock.patch('importlib.import_module')
@@ -316,7 +248,6 @@ class TestUtils(TestBase):
         self.assertIn("num_hidden_layers", str(context.exception))
 
     def test_update_aclgraph_sizes(self):
-        # max_num_batch_sizes < len(original_sizes)
         test_compilation_config = CompilationConfig(
             cudagraph_capture_sizes=[i for i in range(150)])
         model_path = os.path.join(os.path.dirname(__file__), "fake_weight")
@@ -325,42 +256,35 @@ class TestUtils(TestBase):
         test_vllm_config = VllmConfig(
             model_config=test_model_config,
             compilation_config=test_compilation_config,
-            parallel_config=test_parallel_config,
-        )
+            parallel_config=test_parallel_config)
         utils.update_aclgraph_sizes(test_vllm_config)
-        self.assertEqual(
-            147,
-            len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
-        # max_num_batch_sizes >= len(original_sizes)
-        test_compilation_config = CompilationConfig(
-            cudagraph_capture_sizes=[1, 2, 3])
-        test_vllm_config = VllmConfig(
-            model_config=test_model_config,
-            compilation_config=test_compilation_config,
-            parallel_config=test_parallel_config,
-        )
+        os.environ['HCCL_OP_EXPANSION_MODE'] = 'AIV'
         utils.update_aclgraph_sizes(test_vllm_config)
+        del os.environ['HCCL_OP_EXPANSION_MODE']
+
         self.assertEqual(
-            3,
+            0,
             len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
 
     @mock.patch("vllm.model_executor.custom_op.CustomOp")
     @mock.patch("vllm_ascend.ops.activation.AscendQuickGELU")
     @mock.patch("vllm_ascend.ops.activation.AscendSiluAndMul")
-    def test_register_ascend_customop(self, mock_ascend_silu_and_mul,
+    @mock.patch("vllm_ascend.ops.layernorm.AscendRMSNorm")
+    def test_register_ascend_customop(self, mock_ascend_rmsnorm,
+                                      mock_ascend_silu_and_mul,
                                       mock_ascend_quick_gelu, mock_customop):
         utils._ASCEND_CUSTOMOP_IS_REIGISTERED = False
 
         # ascend custom op is not registered
         utils.register_ascend_customop()
-        # should call register_oot twice
-        self.assertEqual(mock_customop.register_oot.call_count, 2)
+        self.assertEqual(mock_customop.register_oot.call_count,
+                         len(REGISTERED_ASCEND_OPS))
         self.assertTrue(utils._ASCEND_CUSTOMOP_IS_REIGISTERED)
 
         # ascend custom op is already registered
         utils.register_ascend_customop()
-        # should not register_oot again, thus only called twice in this ut
-        self.assertEqual(mock_customop.register_oot.call_count, 2)
+        self.assertEqual(mock_customop.register_oot.call_count,
+                         len(REGISTERED_ASCEND_OPS))
 
 
 class TestProfileExecuteDuration(TestBase):

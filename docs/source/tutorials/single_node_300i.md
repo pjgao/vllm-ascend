@@ -1,19 +1,23 @@
-# Single Node (Atlas 300I series)
+# Single Node (Atlas 300I Series)
 
 ```{note}
-This Atlas 300I series is currently experimental. In future versions, there may be behavioral changes around model coverage, performance improvement.
+1. This Atlas 300I series is currently experimental. In future versions, there may be behavioral changes related to model coverage and performance improvement.
+2. Currently, the 310I series only supports eager mode and the float16 data type.
+3. There are some known issues for running vLLM on 310p series, you can refer to vllm-ascend [<u>#3316</u>](https://github.com/vllm-project/vllm-ascend/issues/3316) and 
+ [<u>#2795</u>](https://github.com/vllm-project/vllm-ascend/issues/2795). You can use v0.10.0rc1 version first.
 ```
 
-## Run vLLM on Altlas 300I series
+## Run vLLM on Atlas 300I Series
 
 Run docker container:
 
 ```{code-block} bash
    :substitutions:
 # Update the vllm-ascend image
-export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-310p
+export IMAGE=quay.io/ascend/vllm-ascend:v0.10.0rc1-310p
 docker run --rm \
 --name vllm-ascend \
+--shm-size=1g \
 --device /dev/davinci0 \
 --device /dev/davinci1 \
 --device /dev/davinci2 \
@@ -35,7 +39,7 @@ docker run --rm \
 -it $IMAGE bash
 ```
 
-Setup environment variables:
+Set up environment variables:
 
 ```bash
 # Load model from ModelScope to speed up download
@@ -47,7 +51,7 @@ export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
 
 ### Online Inference on NPU
 
-Run the following script to start the vLLM server on NPU(Qwen3-0.6B:1 card, Qwen2.5-7B-Instruct:2 cards, Pangu-Pro-MoE-72B: 8 cards):
+Run the following script to start the vLLM server on NPU (Qwen3-0.6B:1 card, Qwen2.5-7B-Instruct:2 cards, Pangu-Pro-MoE-72B: 8 cards):
 
 :::::{tab-set}
 :sync-group: inference
@@ -83,7 +87,7 @@ curl http://localhost:8000/v1/completions \
 
 ::::
 
-::::{tab-item} Qwen/Qwen2.5-7B-Instruct
+::::{tab-item} Qwen2.5-7B-Instruct
 :sync: qwen7b
 
 Run the following command to start the vLLM server:
@@ -92,6 +96,36 @@ Run the following command to start the vLLM server:
    :substitutions:
 vllm serve Qwen/Qwen2.5-7B-Instruct \
     --tensor-parallel-size 2 \
+    --enforce-eager \
+    --dtype float16 \
+    --compilation-config '{"custom_ops":["none", "+rms_norm", "+rotary_embedding"]}'
+```
+
+Once your server is started, you can query the model with input prompts
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "The future of AI is",
+    "max_tokens": 64,
+    "top_p": 0.95,
+    "top_k": 50,
+    "temperature": 0.6
+  }'
+```
+
+::::
+
+::::{tab-item} Qwen2.5-VL-3B-Instruct
+:sync: qwen-vl-2.5-3b
+
+Run the following command to start the vLLM server:
+
+```{code-block} bash
+   :substitutions:
+vllm serve Qwen/Qwen2.5-VL-3B-Instruct \
+    --tensor-parallel-size 1 \
     --enforce-eager \
     --dtype float16 \
     --compilation-config '{"custom_ops":["none", "+rms_norm", "+rotary_embedding"]}'
@@ -137,7 +171,7 @@ vllm serve /home/pangu-pro-moe-mode/ \
 
 ```
 
-Once your server is started, you can query the model with input prompts
+Once your server is started, you can query the model with input prompts.
 
 ```bash
 export question="你是谁？"
@@ -235,6 +269,49 @@ sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
 llm = LLM(
     model="Qwen/Qwen2.5-7B-Instruct",
     tensor_parallel_size=2,
+    enforce_eager=True, # For 300I series, only eager mode is supported.
+    dtype="float16", # IMPORTANT cause some ATB ops cannot support bf16 on 300I series
+    compilation_config={"custom_ops":["none", "+rms_norm", "+rotary_embedding"]}, # High performance for 300I series
+)
+# Generate texts from the prompts.
+outputs = llm.generate(prompts, sampling_params)
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+del llm
+clean_up()
+```
+
+::::
+
+::::{tab-item} Qwen2.5-VL-3B-Instruct
+:sync: qwen-vl-2.5-3b
+
+```{code-block} python
+   :substitutions:
+from vllm import LLM, SamplingParams
+import gc
+import torch
+from vllm import LLM, SamplingParams
+from vllm.distributed.parallel_state import (destroy_distributed_environment,
+                                             destroy_model_parallel)
+
+def clean_up():
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    gc.collect()
+    torch.npu.empty_cache()
+prompts = [
+    "Hello, my name is",
+    "The future of AI is",
+]
+# Create a sampling params object.
+sampling_params = SamplingParams(max_tokens=100, top_p=0.95, top_k=50, temperature=0.6)
+# Create an LLM.
+llm = LLM(
+    model="Qwen/Qwen2.5-VL-3B-Instruct",
+    tensor_parallel_size=1,
     enforce_eager=True, # For 300I series, only eager mode is supported.
     dtype="float16", # IMPORTANT cause some ATB ops cannot support bf16 on 300I series
     compilation_config={"custom_ops":["none", "+rms_norm", "+rotary_embedding"]}, # High performance for 300I series

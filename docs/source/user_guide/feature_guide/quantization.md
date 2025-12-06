@@ -2,65 +2,68 @@
 
 Model quantization is a technique that reduces the size and computational requirements of a model by lowering the data precision of the weights and activation values in the model, thereby saving the memory and improving the inference speed.
 
-Since 0.9.0rc2 version, quantization feature is experimentally supported in vLLM Ascend. Users can enable quantization feature by specifying `--quantization ascend`. Currently, only Qwen, DeepSeek series models are well tested. We’ll support more quantization algorithm and models in the future.
+Since version 0.9.0rc2, the quantization feature is experimentally supported by vLLM Ascend. Users can enable the quantization feature by specifying `--quantization ascend`. Currently, only Qwen, DeepSeek series models are well tested. We will support more quantization algorithms and models in the future.
 
-## Install modelslim
+## Install ModelSlim
 
-To quantize a model, users should install [ModelSlim](https://gitee.com/ascend/msit/blob/master/msmodelslim/README.md) which is the Ascend compression and acceleration tool. It is an affinity-based compression tool designed for acceleration, using compression as its core technology and built upon the Ascend platform.
+To quantize a model, you should install [ModelSlim](https://gitee.com/ascend/msit/blob/master/msmodelslim/README.md) which is the Ascend compression and acceleration tool. It is an affinity-based compression tool designed for acceleration, using compression as its core technology and built upon the Ascend platform.
 
-Currently, only the specific tag [modelslim-VLLM-8.1.RC1.b020_001](https://gitee.com/ascend/msit/blob/modelslim-VLLM-8.1.RC1.b020_001/msmodelslim/README.md) of modelslim works with vLLM Ascend. Please do not install other version until modelslim master version is available for vLLM Ascend in the future.
-
-Install modelslim:
+Install ModelSlim:
 
 ```bash
-git clone https://gitee.com/ascend/msit -b modelslim-VLLM-8.1.RC1.b020_001
+# The branch(br_release_MindStudio_8.1.RC2_TR5_20260624) has been verified
+git clone -b br_release_MindStudio_8.1.RC2_TR5_20260624 https://gitee.com/ascend/msit
+
 cd msit/msmodelslim
+
 bash install.sh
 pip install accelerate
 ```
 
 ## Quantize model
 
-Take [DeepSeek-V2-Lite](https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite) as an example, you just need to download the model, and then execute the convert command. The command is shown below. More info can be found in modelslim doc [deepseek w8a8 dynamic quantization docs](https://gitee.com/ascend/msit/blob/modelslim-VLLM-8.1.RC1.b020_001/msmodelslim/example/DeepSeek/README.md#deepseek-v2-w8a8-dynamic%E9%87%8F%E5%8C%96).
+:::{note}
+You can choose to convert the model yourself or use the quantized model we uploaded.
+See https://www.modelscope.cn/models/vllm-ascend/Kimi-K2-Instruct-W8A8.
+This conversion process requires a larger CPU memory, ensure that the RAM size is greater than 2 TB.
+:::
+
+### Adapts and changes
+1. Ascend does not support the `flash_attn` library. To run the model, you need to follow the [guide](https://gitee.com/ascend/msit/blob/master/msmodelslim/example/DeepSeek/README.md#deepseek-v3r1) and comment out certain parts of the code in `modeling_deepseek.py` located in the weights folder.
+2. The current version of transformers does not support loading weights in FP8 quantization format. you need to follow the [guide](https://gitee.com/ascend/msit/blob/master/msmodelslim/example/DeepSeek/README.md#deepseek-v3r1) and delete the quantization related fields from `config.json` in the weights folder.
+
+### Generate the W8A8 weights
 
 ```bash
 cd example/DeepSeek
-python3 quant_deepseek.py --model_path {original_model_path} --save_directory {quantized_model_save_path} --device_type cpu --act_method 2 --w_bit 8 --a_bit 8  --is_dynamic True
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
+export MODEL_PATH="/root/.cache/Kimi-K2-Instruct"
+export SAVE_PATH="/root/.cache/Kimi-K2-Instruct-W8A8"
+
+python3 quant_deepseek_w8a8.py --model_path $MODEL_PATH --save_path $SAVE_PATH --batch_size 4
 ```
 
-:::{note}
-You can also download the quantized model that we uploaded. Please note that these weights should be used for test only. For example, https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V2-Lite-W8A8
-:::
-
-Once convert action is done, there are two important files generated.
-
-1. [config.json](https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V2-Lite-W8A8/file/view/master/config.json?status=1). Please make sure that there is no `quantization_config` field in it.
-
-2. [quant_model_description.json](https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V2-Lite-W8A8/file/view/master/quant_model_description.json?status=1). All the converted weights info are recorded in this file.
-
-Here is the full converted model files:
+Here is the full converted model files except safetensors:
 
 ```bash
 .
-├── config.json
-├── configuration_deepseek.py
-├── configuration.json
-├── generation_config.json
-├── quant_model_description.json
-├── quant_model_weight_w8a8_dynamic-00001-of-00004.safetensors
-├── quant_model_weight_w8a8_dynamic-00002-of-00004.safetensors
-├── quant_model_weight_w8a8_dynamic-00003-of-00004.safetensors
-├── quant_model_weight_w8a8_dynamic-00004-of-00004.safetensors
-├── quant_model_weight_w8a8_dynamic.safetensors.index.json
-├── README.md
-├── tokenization_deepseek_fast.py
-├── tokenizer_config.json
-└── tokenizer.json
+|-- config.json
+|-- configuration.json
+|-- configuration_deepseek.py
+|-- generation_config.json
+|-- modeling_deepseek.py
+|-- quant_model_description.json
+|-- quant_model_weight_w8a8_dynamic.safetensors.index.json
+|-- tiktoken.model
+|-- tokenization_kimi.py
+`-- tokenizer_config.json
 ```
 
 ## Run the model
 
-Now, you can run the quantized models with vLLM Ascend. Here is the example for online and offline inference.
+Now, you can run the quantized model with vLLM Ascend. Examples for online and offline inference are provided as follows:
 
 ### Offline inference
 
@@ -90,36 +93,33 @@ for output in outputs:
 
 ### Online inference
 
-```bash
-# Enable quantization by specifying `--quantization ascend`
-vllm serve {quantized_model_save_path} --served-model-name "deepseek-v2-lite-w8a8" --max-model-len 2048 --quantization ascend --trust-remote-code
-```
+Enable quantization by specifying `--quantization ascend`, for more details, see the [DeepSeek-V3-W8A8 Tutorial](https://vllm-ascend.readthedocs.io/en/latest/tutorials/multi_node.html).
 
 ## FAQs
 
-### 1. How to solve the KeyError: 'xxx.layers.0.self_attn.q_proj.weight' problem?
+### 1. How to solve the KeyError "xxx.layers.0.self_attn.q_proj.weight"?
 
-First, make sure you specify `ascend` quantization method. Second, check if your model is converted by this `modelslim-VLLM-8.1.RC1.b020_001` modelslim version. Finally, if it still doesn't work, please
-submit a issue, maybe some new models need to be adapted.
+First, make sure you specify `ascend` as the quantization method. Second, check if your model is converted by the `br_release_MindStudio_8.1.RC2_TR5_20260624` ModelSlim version. Finally, if it still does not work, submit an issue. Maybe some new models need to be adapted.
 
 ### 2. How to solve the error "Could not locate the configuration_deepseek.py"?
 
-Please convert DeepSeek series models using `modelslim-VLLM-8.1.RC1.b020_001` modelslim, this version has fixed the missing configuration_deepseek.py error.
+Please convert DeepSeek series models using `br_release_MindStudio_8.1.RC2_TR5_20260624` ModelSlim, where the missing configuration_deepseek.py error has been fixed.
 
-### 3. When converting deepseek series models with modelslim, what should you pay attention?
+### 3. What should be considered when converting DeepSeek series models with ModelSlim?
 
-When using the weight generated by modelslim with the `--dynamic` parameter, if torchair graph mode is enabled, please modify the configuration file in the CANN package to prevent incorrect inference results.
+When the MLA portion of the weights used the `W8A8_DYNAMIC` quantization with the torchair graph mode enabled, modify the configuration file in the CANN package to prevent incorrect inference results.
 
 The operation steps are as follows:
 
-1. Search in the CANN package directory used, for example:
+1. Search in the CANN package directory, for example:
 find /usr/local/Ascend/ -name fusion_config.json
 
-2. Add `"AddRmsNormDynamicQuantFusionPass":"off",` to the fusion_config.json you find, the location is as follows:
+2. Add `"AddRmsNormDynamicQuantFusionPass":"off",` and `"MultiAddRmsNormDynamicQuantFusionPass":"off",` to the fusion_config.json you find, the location is as follows:
 
 ```bash
 {
     "Switch":{
         "GraphFusion":{
             "AddRmsNormDynamicQuantFusionPass":"off",
+            "MultiAddRmsNormDynamicQuantFusionPass":"off",
 ```

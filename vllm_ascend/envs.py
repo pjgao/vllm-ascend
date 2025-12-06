@@ -50,11 +50,11 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # value is None, which means the system default C compiler will be used.
     "C_COMPILER":
     lambda: os.getenv("C_COMPILER", None),
-    # The version of the Ascend chip. If not set, the default value is
-    # ASCEND910B1(Available for A2 and A3 series). It's used for package building.
+    # The version of the Ascend chip. It's used for package building.
+    # If not set, we will query chip info through `npu-smi`.
     # Please make sure that the version is correct.
     "SOC_VERSION":
-    lambda: os.getenv("SOC_VERSION", "ASCEND910B1"),
+    lambda: os.getenv("SOC_VERSION", None),
     # If set, vllm-ascend will print verbose logs during compilation
     "VERBOSE":
     lambda: bool(int(os.getenv('VERBOSE', '0'))),
@@ -62,28 +62,10 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # /usr/local/Ascend/ascend-toolkit/latest
     "ASCEND_HOME_PATH":
     lambda: os.getenv("ASCEND_HOME_PATH", None),
-    # The path for HCCN Tool, the tool will be called by disaggregated prefilling
-    # case.
-    "HCCN_PATH":
-    lambda: os.getenv("HCCN_PATH", "/usr/local/Ascend/driver/tools/hccn_tool"),
     # The path for HCCL library, it's used by pyhccl communicator backend. If
-    # not set, the default value is libhccl.so。
+    # not set, the default value is libhccl.so.
     "HCCL_SO_PATH":
-    # The prefill device id for disaggregated prefilling case.
     lambda: os.environ.get("HCCL_SO_PATH", None),
-    "PROMPT_DEVICE_ID":
-    lambda: os.getenv("PROMPT_DEVICE_ID", None),
-    # The decode device id for disaggregated prefilling case.
-    "DECODE_DEVICE_ID":
-    lambda: os.getenv("DECODE_DEVICE_ID", None),
-    # The port number for llmdatadist communication. If not set, the default
-    # value is 26000.
-    "LLMDATADIST_COMM_PORT":
-    lambda: os.getenv("LLMDATADIST_COMM_PORT", "26000"),
-    # The wait time for llmdatadist sync cache. If not set, the default value is
-    # 5000ms.
-    "LLMDATADIST_SYNC_CACHE_WAIT_TIME":
-    lambda: os.getenv("LLMDATADIST_SYNC_CACHE_WAIT_TIME", "5000"),
     # The version of vllm is installed. This value is used for developers who
     # installed vllm from source locally. In this case, the version of vllm is
     # usually changed. For example, if the version of vllm is "0.9.0", but when
@@ -100,40 +82,27 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP":
     lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP", '0'))
                  ),
-    "VLLM_ASCEND_ENABLE_DBO":
-    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),
     # Whether to enable the model execute time observe profile. Disable it when
     # running vllm ascend in production environment.
     "VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE":
     lambda: bool(int(os.getenv("VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE", '0'))
                  ),
-    # MOE_ALL2ALL_BUFFER:
-    #   0: default, normal init.
-    #   1: enable moe_all2all_buffer.
-    "MOE_ALL2ALL_BUFFER":
-    lambda: bool(int(os.getenv("MOE_ALL2ALL_BUFFER", '0'))),
     # Some models are optimized by vllm ascend. While in some case, e.g. rlhf
     # training, the optimized model may not be suitable. In this case, set this
     # value to False to disable the optimized model.
     "USE_OPTIMIZED_MODEL":
     lambda: bool(int(os.getenv('USE_OPTIMIZED_MODEL', '1'))),
-    # SELECT_GATING_TOPK_SOTFMAX_EXPERTS is the equivalent of select_experts in non-quantized scenarios.
-    # In theory, it should have better performance than select_experts.
-    # Subsequent versions will remove the SELECT_GATING_TOPK_SOTFMAX_EXPERTS tag and use it as the default mode.
-    "SELECT_GATING_TOPK_SOTFMAX_EXPERTS":
-    lambda: bool(int(os.getenv("SELECT_GATING_TOPK_SOTFMAX_EXPERTS", '0'))),
     # The tolerance of the kv cache size, if the difference between the
     # actual kv cache size and the cached kv cache size is less than this value,
     # then the cached kv cache size will be used.
     "VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE":
     lambda: int(
         os.getenv("VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE", 64)),
-    # Whether to enable the topk optimization. It's disabled by default for experimental support
-    # We'll make it enabled by default in the future.
+    # Whether to enable the topk optimization. It's enabled by default. Please set to False if you hit any issue.
+    # We'll remove this flag in the future once it's stable enough.
     "VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION":
     lambda: bool(
-        int(os.getenv("VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION", '0'))),
-
+        int(os.getenv("VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION", '1'))),
     # `LLMDataDistCMgrConnector` required variable. `DISAGGREGATED_PREFILL_RANK_TABLE_PATH` is
     # used for llmdatadist to build the communication topology for kv cache transfer, it is
     # a required variable if `LLMDataDistCMgrConnector` is used as kv connector for disaggregated
@@ -146,15 +115,67 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # remote worker.
     "VLLM_ASCEND_LLMDD_RPC_IP":
     lambda: os.getenv("VLLM_ASCEND_LLMDD_RPC_IP", "0.0.0.0"),
-    # `LLMDataDistCMgrConnector` required variable. `VLLM_LLMDD_RPC_PORT` is used as the
+    # `LLMDataDistCMgrConnector` required variable. `VLLM_ASCEND_LLMDD_RPC_PORT` is used as the
     # rpc communication listening port, which will be used to receive the agent metadata from the
     # remote worker.
-    "VLLM_LLMDD_RPC_PORT":
-    lambda: int(os.getenv("VLLM_LLMDD_RPC_PORT", 5557)),
+    "VLLM_ASCEND_LLMDD_RPC_PORT":
+    lambda: int(os.getenv("VLLM_ASCEND_LLMDD_RPC_PORT", 5557)),
     # Whether to enable mla_pa for deepseek mla decode, this flag will be removed after its available torch_npu is public accessible
     # and the mla_pa will be the default path of deepseek decode path.
     "VLLM_ASCEND_MLA_PA":
-    lambda: int(os.getenv("VLLM_ASCEND_MLA_PA", 0))
+    lambda: int(os.getenv("VLLM_ASCEND_MLA_PA", 0)),
+    # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
+    # this feature is supported in A2, and eager mode will get better performance.
+    "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", '0'))),
+    # Whether to enable FlashComm optimization when tensor parallel is enabled.
+    # This feature will get better performance when concurrency is large.
+    "VLLM_ASCEND_ENABLE_FLASHCOMM1":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", '0'))),
+    # Whether to enable FLASHCOMM2. Setting it to 0 disables the feature, while setting it to 1 or above enables it.
+    # The specific value set will be used as the O-matrix TP group size for flashcomm2.
+    # For a detailed introduction to the parameters and the differences and applicable scenarios
+    # between this feature and FLASHCOMM1, please refer to the feature guide in the documentation.
+    "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE":
+    lambda: int(os.getenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", 0)),
+    # Whether to enable MLP weight prefetch, only used in small concurrency.
+    "VLLM_ASCEND_ENABLE_PREFETCH_MLP":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PREFETCH_MLP", '0'))),
+    # buffer size for gate up prefetch
+    "VLLM_ASCEND_MLP_GATE_UP_PREFETCH_SIZE":
+    lambda: int(
+        os.getenv("VLLM_ASCEND_MLP_GATE_UP_PREFETCH_SIZE", 18 * 1024 * 1024)),
+    # buffer size for down proj prefetch
+    "VLLM_ASCEND_MLP_DOWN_PREFETCH_SIZE":
+    lambda: int(
+        os.getenv("VLLM_ASCEND_MLP_DOWN_PREFETCH_SIZE", 18 * 1024 * 1024)),
+    # Whether to enable dense model and general optimizations for better performance.
+    # Since we modified the base parent class `linear`, this optimization is also applicable to other model types.
+    # However, there might be hidden issues, and it is currently recommended to prioritize its use with dense models.
+    "VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE", '0'))),
+    # Whether to enable mlp optimize when tensor parallel is enabled.
+    # this feature in eager mode will get better performance.
+    "VLLM_ASCEND_ENABLE_MLP_OPTIMIZE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLP_OPTIMIZE", '0'))),
+    # Determine the number of physical devices in a non-full-use scenario
+    # caused by the initialization of the Mooncake connector.
+    "PHYSICAL_DEVICES":
+    lambda: os.getenv("PHYSICAL_DEVICES", None),
+    # Whether to enable msMonitor tool to monitor the performance of vllm-ascend.
+    "MSMONITOR_USE_DAEMON":
+    lambda: bool(int(os.getenv("MSMONITOR_USE_DAEMON", '0'))),
+    "VLLM_ASCEND_ENABLE_MLAPO":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", '0'))),
+    # Whether to enable transpose weight and cast format to FRACTAL_NZ.
+    "VLLM_ASCEND_ENABLE_NZ":
+    lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
+    # Decide whether we should enable CP parallelism.
+    "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", '0'))),
+    # Whether to anbale dynamic EPLB
+    "DYNAMIC_EPLB":
+    lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
 }
 
 # end-env-vars-definition

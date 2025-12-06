@@ -17,19 +17,15 @@ import torch
 
 def _generate_attn_mask(max_seq_len, dtype):
     # Construct lower triangle matrix.
-    mask_flag = torch.tril(
-        torch.ones((max_seq_len, max_seq_len),
-                   dtype=torch.bool)).view(max_seq_len, max_seq_len)
+    mask_flag = torch.ones((max_seq_len, max_seq_len),
+                           dtype=torch.bool).tril_()
     # Create upper triangle matrix used to mark mask positions.
     mask_flag = ~mask_flag
     # Currently for fp16 dtype, the mask value should be set to -inf.
     # TODO: Eliminate this part in the future.
-    if dtype == torch.float16:
-        mask_value = torch.finfo(torch.float32).min
-    else:
-        mask_value = 1
-    attn_mask = torch.masked_fill(torch.zeros(size=(max_seq_len, max_seq_len)),
-                                  mask_flag, mask_value).to(dtype)
+    mask_value = float('-inf') if dtype == torch.float16 else 1
+    attn_mask = torch.zeros(size=(max_seq_len, max_seq_len), dtype=dtype) \
+        .masked_fill_(mask_flag, mask_value)
     return attn_mask
 
 
@@ -39,66 +35,62 @@ class AttentionMaskBuilder:
         self,
         max_seq_len: int,
         dtype: torch.dtype,
+        device: torch.device = None,
     ):
+        # NOTE: The device argument specifies the target NPU
+        # to be used for the newly added FIA operator.
+        # Only pass this parameter when using the new FIA operator.
+
         attn_mask = _generate_attn_mask(max_seq_len, dtype)
 
         self._seq_len_cached = attn_mask.shape[0]
         self.attn_mask_cache = attn_mask
-        self.splitfuse_mask_value = -10000
+        self.device = device
+        self.pooling_mask = None
+        assigned_mask_dim = 2048
+        self.chunked_prefill_attn_mask = torch.triu(
+            torch.ones(assigned_mask_dim, assigned_mask_dim),
+            diagonal=1).to(torch.int8).to(device)
+
+    @staticmethod
+    def get_mask_scale_factor(dtype: torch.dtype = torch.float16):
+        if dtype == torch.float16:
+            mask_scale_factor = 1
+        elif dtype == torch.bfloat16:
+            mask_scale_factor = -10000
+        else:
+            raise ValueError(
+                "The current operation now only supports data types: torch.float16 and "
+                "torch.bfloat16. Please ensure the input is of one of these types."
+            )
+        return mask_scale_factor
 
     def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype,
                       device: torch.device):
-        self._update_attn_cache(max_seq_len, dtype, device)
-        return self.attn_mask_cache[:max_seq_len, :max_seq_len].contiguous()
+        self._update_attn_cache(max_seq_len, dtype)
+        return self.attn_mask_cache[:max_seq_len, :max_seq_len].contiguous(
+        ).to(device, non_blocking=True)
+
+    def get_pooling_mask(self, device):
+        if self.pooling_mask is None:
+            # the compressed attention mask for npu_fusion_attention sparse mode 4
+            self.pooling_mask = torch.triu(torch.ones(
+                2048, 2048), diagonal=1).to(torch.bool).to(device,
+                                                           non_blocking=True)
+        return self.pooling_mask
 
     def get_splitfuse_attn_mask(
         self,
-        seq_lens,
-        query_lens,
-        position,
-        dtype,
-        device,
+        seq_lens: torch.Tensor = None,
+        position: torch.Tensor = None,
+        dtype: torch.dtype = None,
+        device: torch.device = None,
     ) -> torch.Tensor:
-        max_seq_len = max(seq_lens, default=0)
-        if max_seq_len <= self._seq_len_cached:
-            self._update_attn_cache(max_seq_len, dtype, device)
-            # FIXME: Currently the mask value of chunked-prefill situation and Prefill-Only situation
-            # is not the same. Fix this in the future when kernel is ready.
-            if self.attn_mask_cache.numel(
-            ) > 1 and self.attn_mask_cache[0][1] > 0:
-                attn_mask = self.get_attn_mask(  # type: ignore
-                    max_seq_len, dtype, device)
-                # Do not use in-place multiplication to avoid modifying `self.attn_mask_cache`!
-                attn_mask = attn_mask * -10000
-            else:
-                attn_mask = self.attn_mask_cache
-            return torch.index_select(attn_mask, dim=0,
-                                      index=position)[:, :max_seq_len]
-        total_q_len = sum(query_lens)
-        attn_mask = torch.zeros((total_q_len, max_seq_len),
-                                dtype=dtype,
-                                device="cpu")
-        current_row = 0
-        for i in range(len(query_lens)):
-            seq_len = seq_lens[i]
-            q_len = query_lens[i]
-            context_len = seq_len - q_len
+        return self.chunked_prefill_attn_mask
 
-            assert context_len >= 0
-            attn_mask[current_row:current_row + q_len,
-                      context_len:] = self.splitfuse_mask_value
-            right_tensor = attn_mask[current_row:current_row + q_len,
-                                     context_len:seq_len]
-            right_tensor.masked_fill_(
-                right_tensor.tril() == self.splitfuse_mask_value, 0)
-            current_row += q_len
-
-        return attn_mask.to(device, non_blocking=True)
-
-    def _update_attn_cache(self, seqlen: int, dtype: torch.dtype,
-                           device: torch.device):
+    def _update_attn_cache(self, seqlen: int, dtype: torch.dtype):
         if seqlen > self._seq_len_cached:
             self._seq_len_cached = seqlen
             self.attn_mask_cache = _generate_attn_mask(seqlen, dtype)
-        if self.attn_mask_cache.device != device:
-            self.attn_mask_cache = self.attn_mask_cache.to(device)
+        if self.attn_mask_cache.dtype != dtype:
+            self.attn_mask_cache = self.attn_mask_cache.to(dtype)

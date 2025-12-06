@@ -15,12 +15,20 @@
 # limitations under the License.
 #
 
-from vllm_ascend.utils import vllm_version_is
+from vllm.triton_utils import HAS_TRITON
 
-# Import specific patches for different versions
-if vllm_version_is("0.10.0"):
-    from vllm_ascend.patch.worker import patch_0_10_0  # noqa: F401
-    from vllm_ascend.patch.worker import patch_common  # noqa: F401
-else:
-    from vllm_ascend.patch.worker import patch_common  # noqa: F401
-    from vllm_ascend.patch.worker import patch_main  # noqa: F401
+if HAS_TRITON:
+    import vllm_ascend.patch.worker.patch_triton
+
+# isort: off
+import vllm_ascend.patch.platform.patch_sched_yield  # noqa
+import vllm_ascend.patch.worker.patch_distributed  # noqa
+import vllm_ascend.patch.worker.patch_deepseek  # noqa
+import vllm_ascend.patch.worker.patch_roberta  # noqa
+import vllm_ascend.patch.worker.patch_weight_loader  # noqa
+import vllm_ascend.patch.worker.patch_multimodal_merge  # noqa
+import vllm_ascend.patch.worker.patch_minicpm  # noqa
+import vllm_ascend.patch.worker.patch_qwen2_5_vl  # noqa
+import vllm_ascend.patch.worker.patch_qwen2_5_omni  # noqa
+import vllm_ascend.patch.worker.patch_qwen3_vl  # noqa
+import vllm_ascend.patch.worker.patch_rope  # noqa

@@ -21,9 +21,13 @@ import torch
 import torch_npu
 from vllm.attention.backends.abstract import AttentionType
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_310p
+from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ,
+                               COMPRESSED_TENSORS_METHOD, AscendDeviceType,
+                               get_ascend_device_type, is_enable_nz)
 
 
 def quant_per_tensor(in_tensor: torch.Tensor,
@@ -43,7 +47,8 @@ class AscendW8A8LinearMethod:
 
     def __init__(self) -> None:
         # aclnn quant matmul requires to transpose matrix B, set to true by default.
-        self.transpose_weight = not is_310p()
+        self.transpose_weight = get_ascend_device_type(
+        ) != AscendDeviceType._310P
 
     @staticmethod
     def get_weight(
@@ -84,6 +89,13 @@ class AscendW8A8LinearMethod:
                                                    dtype=params_dtype)
         return params_dict
 
+    def get_pergroup_param(self,
+                           input_size: int,
+                           output_size: int,
+                           params_dtype: torch.dtype,
+                           layer_type: Optional[str] = None) -> Dict[str, Any]:
+        return {}
+
     @staticmethod
     def apply(
         layer: torch.nn.Module,
@@ -92,13 +104,63 @@ class AscendW8A8LinearMethod:
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
         if x.dtype != torch.int8:
-            x = quant_per_tensor(
-                x,
-                layer.aclnn_input_scale_reciprocal,
-                layer.aclnn_input_offset,
-            )
+            layer_cls_name = layer.__class__.__name__
+            try:
+                weight_prefetch_method = get_forward_context(
+                ).weight_prefetch_method
+            except AssertionError:
+                weight_prefetch_method = None
+
+            # prefetch qkvo_proj.weight preprocess
+            if weight_prefetch_method:
+                weight_prefetch_method.maybe_prefetch_attn_weight_preprocess(
+                    layer_cls_name=layer_cls_name,
+                    weight=layer.weight,
+                    start_flag=x,
+                )
+            try:
+                quant_comm_config = getattr(layer, "_quant_comm_config")
+            except AttributeError:
+                quant_comm_config = {}
+            comm_fn = quant_comm_config.get("communication_fn")
+            enable_flashcomm2_quant_comm = comm_fn is not None and (
+                "o_proj" in layer.prefix or "out_proj" in layer.prefix)
+            if enable_flashcomm2_quant_comm:
+                quant_input_x = x.contiguous().view(
+                    -1, layer.aclnn_input_scale_reciprocal.size(0))
+                quant_x = quant_per_tensor(
+                    quant_input_x,
+                    layer.aclnn_input_scale_reciprocal,
+                    layer.aclnn_input_offset,
+                )
+                comm_input = quant_x.view(x.size(0), -1)
+                assert comm_fn is not None
+                x = comm_fn(comm_input)
+            else:
+                # quant
+                x = quant_per_tensor(
+                    x,
+                    layer.aclnn_input_scale_reciprocal,
+                    layer.aclnn_input_offset,
+                )
+
+            # prefetch qkvo_proj.weight postprocess
+            if weight_prefetch_method:
+                weight_prefetch_method.maybe_prefetch_attn_weight_postprocess(
+                    layer_cls_name=layer_cls_name,
+                    stop_flag=x,
+                )
+
         quant_bias = layer.quant_bias if tp_rank == 0 else None
-        if is_310p():
+
+        try:
+            ascend_quant_method = getattr(layer, "ascend_quant_method")
+        except AttributeError:
+            ascend_quant_method = ""
+        if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
+            quant_bias = bias
+
+        if get_ascend_device_type() == AscendDeviceType._310P:
             # On 300I Duo platform, we need transpose again if
             # using nz. This transpose can be skipped in torchair.
             output = torch_npu.npu_quant_matmul(
@@ -131,10 +193,16 @@ class AscendW8A8LinearMethod:
             requires_grad=False).to(layer.aclnn_input_scale.dtype)
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data,
-                                                      ACL_FORMAT_FRACTAL_NZ)
+        if is_enable_nz():
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data, ACL_FORMAT_FRACTAL_NZ)
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        ascend_quant_method = getattr(layer, "ascend_quant_method", "")
+        if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
+            deq_scale = layer.input_scale.data * layer.weight_scale.data
+            layer.deq_scale = torch.nn.Parameter(deq_scale,
+                                                 requires_grad=False)
 
 
 class AscendW8A8FusedMoEMethod:
@@ -234,7 +302,7 @@ class AscendW8A8FusedMoEMethod:
         **kwargs,
     ) -> torch.Tensor:
         assert router_logits.shape[
-            1] == global_num_experts, "Number of global experts mismatch"
+            1] == global_num_experts - global_redundant_expert_num, "Number of global experts mismatch (excluding redundancy)"
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -247,10 +315,9 @@ class AscendW8A8FusedMoEMethod:
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts,
-        )
+            global_num_experts=global_num_experts)
 
-        if is_310p():
+        if get_ascend_device_type() == AscendDeviceType._310P:
             return fused_experts_310p(hidden_states=x,
                                       w1=layer.w13_weight,
                                       w1_scale=layer.w13_weight_scale,
@@ -279,7 +346,7 @@ class AscendW8A8FusedMoEMethod:
                              expert_map=expert_map)
 
     def process_weights_after_loading(self, layer):
-        if not is_310p():
+        if get_ascend_device_type() != AscendDeviceType._310P:
             layer.w13_weight.data = layer.w13_weight.data.transpose(
                 1, 2).contiguous()
             layer.w2_weight.data = layer.w2_weight.data.transpose(
@@ -296,7 +363,7 @@ class AscendW8A8FusedMoEMethod:
         expanding_factor_w13 = layer.w13_weight.data.shape[1]
         expanding_factor_w2 = layer.w2_weight.data.shape[1]
 
-        if is_310p():
+        if get_ascend_device_type() == AscendDeviceType._310P:
             layer.w13_input_scale.data = torch.nn.Parameter(
                 layer.w13_input_scale.data.max())
             layer.w2_input_scale.data = torch.nn.Parameter(
@@ -316,7 +383,8 @@ class AscendW8A8FusedMoEMethod:
         # converting ACL_FORMAT_FRACTAL_NZ.
         # npu_quant_grouped_matmul_dequant in eager mode does not accept
         # ACL_FORMAT_FRACTAL_NZ.
-        if not is_310p():
+        if get_ascend_device_type() != AscendDeviceType._310P and is_enable_nz(
+        ):
             layer.w13_weight.data = torch_npu.npu_format_cast(
                 layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ).contiguous()
             layer.w2_weight.data = torch_npu.npu_format_cast(
@@ -641,123 +709,3 @@ def fused_experts(
             "currently does not support tensor parallelism")
 
     return final_hidden_states
-
-
-def select_experts(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    use_grouped_topk: bool,
-    renormalize: bool,
-    topk_group: Optional[int] = None,
-    num_expert_group: Optional[int] = None,
-    custom_routing_function: Optional[Callable] = None,
-    scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None,
-    global_num_experts=-1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Select top-k experts based on router logits.
-
-    Args:
-        hidden_states: Hidden states of shape (num_tokens, hidden_size).
-        router_logits: Router logits of shape (num_tokens, num_experts).
-        top_k: Number of experts to select.
-        use_grouped_topk: Whether to group experts before selecting top-k.
-        renormalize: Whether to renormalize the routing weights.
-        topk_group: Number of expert groups to select from.
-        num_expert_group: Number of experts in each group.
-        custom_routing_function: Custom routing function.
-        scoring_func: Scoring function to use.
-        e_score_correction_bias: Correction bias to apply to expert scores.
-
-    Returns:
-        topk_weights: Routing weights of shape (num_tokens, top_k).
-        topk_ids: Selected expert IDs of shape (num_tokens, top_k).
-
-    Raises:
-        ValueError: If an unsupported scoring function is provided.
-    """
-
-    if scoring_func == "softmax":
-        # NOTE: vLLM use dtype=torch.float here
-        topk_weights = router_logits.softmax(dim=-1)
-    elif scoring_func == "sigmoid":
-        topk_weights = router_logits.sigmoid()
-    else:
-        raise ValueError(f"Unsupported scoring function: {scoring_func}")
-
-    if use_grouped_topk:
-        assert topk_group is not None
-        assert num_expert_group is not None
-
-        if e_score_correction_bias is not None:
-            # Store original scores before applying correction bias. We use biased
-            # scores for expert selection but original scores for routing weights
-            original_weights = topk_weights
-            topk_weights = topk_weights + e_score_correction_bias.unsqueeze(0)
-
-        # TODO: Change to npu_group_topk when the latest CANN and NNAL is available
-        # >>> torch_npu._npu_group_topk(topk_weights, group_num=num_expert_group, k=topk_group)
-        topk_weights = native_grouped_topk(topk_weights, num_expert_group,
-                                           topk_group)
-        # TODO bfloat16 is not supported in torch.topk with ge graph.
-        if e_score_correction_bias is not None:
-            topk_ids = torch.topk(topk_weights.to(torch.float32),
-                                  k=top_k,
-                                  dim=-1,
-                                  sorted=False)[1]
-            # Use original unbiased scores for the routing weights
-            topk_weights = original_weights.gather(1, topk_ids)
-        else:
-            topk_weights, topk_ids = torch.topk(topk_weights.to(torch.float32),
-                                                k=top_k,
-                                                dim=-1,
-                                                sorted=False)
-    elif custom_routing_function is None:
-        topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
-        topk_weights = topk_weights.to(hidden_states.dtype)
-    else:
-        topk_weights, topk_ids = custom_routing_function(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k,
-            renormalize=renormalize,
-            global_num_experts=global_num_experts,
-        )
-        # Required by npu_moe_init_routing
-        topk_ids = topk_ids.to(torch.int32)
-        return topk_weights, topk_ids
-
-    # Required by npu_moe_init_routing
-    topk_ids = topk_ids.to(torch.int32)
-
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    return topk_weights, topk_ids
-
-
-def native_grouped_topk(
-    topk_weights: torch.Tensor,
-    num_expert_group: Optional[int],
-    topk_group: Optional[int],
-):
-    topk_group = 0 if topk_group is None else topk_group
-    num_expert_group = 0 if num_expert_group is None else num_expert_group
-
-    num_token = topk_weights.shape[0]
-    grouped_weights = topk_weights.view(num_token, num_expert_group,
-                                        -1).max(dim=-1).values
-    topk_group_indices = torch.topk(grouped_weights.to(torch.float32),
-                                    k=topk_group,
-                                    dim=-1,
-                                    sorted=False)[1]
-    topk_group_mask = torch.zeros_like(grouped_weights)
-    topk_group_mask.scatter_(1, topk_group_indices, 1)
-    topk_weight_mask = (topk_group_mask.unsqueeze(-1).expand(
-        num_token, num_expert_group,
-        topk_weights.shape[-1] // num_expert_group).reshape(num_token, -1))
-    topk_weights = topk_weights.masked_fill(~topk_weight_mask.bool(), 0.0)
-
-    return topk_weights
