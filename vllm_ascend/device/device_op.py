@@ -649,7 +649,7 @@ class BaseDeviceAdaptor:
     def get_dsa_indexer_quant_mode() -> int:
         """Non-A5: q/k are int8 with fp16 scales, so lightning indexer runs
         in INT8 quant mode (QUANT_MODE_INT8 = 2 in
-        csrc/attention/quant_lightning_indexer_v2)."""
+        csrc/attention/vllm_quant_lightning_indexer_v2)."""
         return 2
 
     @staticmethod
@@ -1389,7 +1389,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     def get_dsa_indexer_quant_mode() -> int:
         """A5: q/k are fp8_e4m3fn with fp32 scales, so lightning indexer runs
         in FP8 quant mode (QUANT_MODE_FP8 = 1 in
-        csrc/attention/quant_lightning_indexer_v2)."""
+        csrc/attention/vllm_quant_lightning_indexer_v2)."""
         return 1
 
     @staticmethod

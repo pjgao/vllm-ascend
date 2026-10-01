@@ -414,7 +414,7 @@ class TestIndexerOps:
             ),
             patch.object(
                 torch.ops._C_ascend,
-                "npu_quant_lightning_indexer_v2",
+                "npu_vllm_quant_lightning_indexer_v2",
                 create=True,
                 return_value=(topk_indices, None),
             ) as qli,

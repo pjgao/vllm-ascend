@@ -739,7 +739,7 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
     smla = Mock(side_effect=native_metadata)
     qli = Mock(side_effect=native_metadata)
     monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", smla, raising=False)
-    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata", qli, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_vllm_quant_lightning_indexer_v2_metadata", qli, raising=False)
     for group_builders in builders:
         for builder in group_builders:
             # Only native operator dispatch is mocked; all coordinates use CPU torch.

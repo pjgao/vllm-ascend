@@ -19,7 +19,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TILING_HEADERS = (
     REPO_ROOT / "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_template_tiling_key.h",
-    REPO_ROOT / "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_template_tiling_key.h",
+    REPO_ROOT / "csrc/attention/vllm_quant_lightning_indexer_v2/op_kernel/vllm_quant_lightning_indexer_v2_template_tiling_key.h",
     REPO_ROOT / "csrc/attention/compressor/op_kernel/arch32/compressor_template_tiling_key.h",
     REPO_ROOT / "csrc/attention/compressor/op_kernel/arch35/compressor_template_tiling_key.h",
 )
@@ -259,7 +259,7 @@ class AuroraTilingKeysTest(unittest.TestCase):
                 if arch != 310:
                     # A2/A3: INT8 Q/K, INT32 output, paged attention, TND / PA_BBND.
                     self.assertEqual(
-                        self.matrices["quant_lightning_indexer_v2", arch],
+                        self.matrices["vllm_quant_lightning_indexer_v2", arch],
                         [
                             (2, 2, 3, 1, 0, 2),
                             (2, 2, 3, 1, 1, 2),
@@ -277,7 +277,7 @@ class AuroraTilingKeysTest(unittest.TestCase):
                 (36, 34, 40, 2), ((1, 0, 2), (1, 1, 2), (0, 0, 0), (0, 1, 1))
             )
         }
-        selected = self.matrices["quant_lightning_indexer_v2", 310]
+        selected = self.matrices["vllm_quant_lightning_indexer_v2", 310]
         self.assertEqual(set(selected), expected)
         self.assertEqual(len(selected), 16)
 
@@ -299,7 +299,7 @@ class AuroraTilingKeysTest(unittest.TestCase):
                 self.assertEqual(self.declarations["sparse_flash_mla", arch], expected)
                 qk_types = [36, 34, 40, 2] if arch == 310 else [2]
                 self.assertEqual(
-                    self.declarations["quant_lightning_indexer_v2", arch],
+                    self.declarations["vllm_quant_lightning_indexer_v2", arch],
                     [
                         ["DT_Q", "dtype", qk_types],
                         ["DT_K", "dtype", qk_types],

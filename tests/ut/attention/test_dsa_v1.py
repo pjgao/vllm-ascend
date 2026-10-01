@@ -641,7 +641,7 @@ def test_dsa_cp_qli_metadata_uses_host_maxima():
 
     with patch.object(
         torch.ops._C_ascend,
-        "npu_quant_lightning_indexer_v2_metadata",
+        "npu_vllm_quant_lightning_indexer_v2_metadata",
         create=True,
         return_value=generated_metadata,
     ) as metadata_op:
@@ -812,7 +812,7 @@ def test_dsa_cp_indexer_waits_before_qli_consumer(monkeypatch):
     for name in ("prepare_dsa_indexer_weights", "prepare_dsa_indexer_query_scale", "prepare_dsa_indexer_key_scale"):
         monkeypatch.setattr(DeviceOperator, name, lambda value: value)
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *_, **__: None, raising=False)
-    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2", run_indexer, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_vllm_quant_lightning_indexer_v2", run_indexer, raising=False)
     monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_cp.rotate_activation", lambda value, _: value)
     monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_cp.wait_for_device_metadata", record_wait)
     impl._indexer_select_topk(

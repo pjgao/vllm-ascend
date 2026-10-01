@@ -1,9 +1,9 @@
 # DeepSeek V4.1 QLI V2 and candidate integration
 
-DeepSeek V4.1's indexer uses `QuantLightningIndexerV2` with paged INT8 index K.
+DeepSeek V4.1's indexer uses `VllmQuantLightningIndexerV2` with paged INT8 index K.
 The imported operator source is from `ops-transformer-qli_candidate.zip`,
 SHA256 `771f0c16b9119c676c10cebef713b168f127ff194f3f2f98edcbcd0979c6f966`.
-Its companion `QuantLightningIndexerV2Metadata` is built and registered too.
+Its companion `VllmQuantLightningIndexerV2Metadata` is built and registered too.
 
 ## Data flow
 

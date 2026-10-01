@@ -42,7 +42,7 @@ def test_candidate_consumer_preserves_each_query_mask(ratio, query_count):
         mask_mode=3,
         cmp_ratio=ratio,
     )
-    metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+    metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_v2_metadata(
         heads,
         1,
         width,
@@ -53,7 +53,7 @@ def test_candidate_consumer_preserves_each_query_mask(ratio, query_count):
         device=str(query.device),
         **common,
     )
-    selected, _, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
+    selected, _, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_v3(
         query,
         key,
         weights,
