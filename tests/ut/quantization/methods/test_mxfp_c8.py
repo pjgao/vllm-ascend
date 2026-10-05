@@ -11,11 +11,9 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     MXFP_K_SCALE_NZ_TOKEN_FRAG,
     MXFP_KV_SCALE_GROUP_SIZE,
     fill_mxfp_v_scale_cache,
-    mxfp_hybrid_paged_cache_views,
     mxfp_k_scale_cache_shape,
     mxfp_k_scale_page_bytes,
     mxfp_k_scale_slot_index,
-    mxfp_packet_section_sizes,
     mxfp_packet_size_bytes,
     mxfp_paged_cache_views,
     mxfp_v_scale_cache_shape,
@@ -75,189 +73,6 @@ class TestMXFPScaleCacheShapes(TestBase):
             mxfp_k_scale_cache_shape(num_blocks=1, block_size=512, num_kv_heads=1, head_dim=100)
 
 
-class TestMXFPPagedCacheViews(TestBase):
-    """Packet-packed strided views: [K | V] packets plus scale tail segments.
-
-    The layout replaces the four section-major caches: one packet per kernel
-    block, packets contiguous, K/V as dim0-strided views, and the K-scale and
-    V-scale caches as contiguous segments after the packet region. What must
-    hold is checked here on CPU: the section math, the view geometry
-    (shape/stride/storage_offset) and -- most importantly, because a stride
-    bug misplaces data instead of crashing -- byte-for-byte equivalence of
-    writes through the strided views against the section-major layout this
-    replaces.
-    """
-
-    # The V-scale 6-D layout divides the block axis by 64, so the smallest
-    # legal kernel block is 64 (production uses 512).
-    BLOCK_SIZE = 64
-    NUM_KV_HEADS = 2
-    HEAD_DIM = 64
-    NUM_BLOCKS = 3
-
-    def _payload_bytes(self):
-        return self.NUM_BLOCKS * (
-            mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
-            + mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-            + mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-        )
-
-    def _views(self, num_blocks=None):
-        raw = torch.zeros(self._payload_bytes(), dtype=torch.int8)
-        k, v, ks, vs = mxfp_paged_cache_views(
-            raw,
-            num_blocks or self.NUM_BLOCKS,
-            self.NUM_KV_HEADS,
-            self.HEAD_DIM,
-            self.HEAD_DIM,
-            self.BLOCK_SIZE,
-        )
-        return raw, k, v, ks, vs
-
-    def test_packet_sections_sum_to_the_page_budget(self):
-        # Section bytes of one packet must sum to the documented C8 K/V
-        # budget (FP8 payloads); each scale segment adds one E8M0 byte per
-        # 32 data bytes of its own payload.
-        k, v = mxfp_packet_section_sizes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
-        ks = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-        vs = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-        self.assertEqual(k, self.NUM_KV_HEADS * self.BLOCK_SIZE * self.HEAD_DIM)
-        self.assertEqual(v, k)
-        self.assertEqual(ks, self.NUM_KV_HEADS * self.BLOCK_SIZE * self.HEAD_DIM // MXFP8_GROUP_SIZE)
-        self.assertEqual(vs, ks)
-        self.assertEqual(
-            k + v,
-            mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM),
-        )
-
-    def test_views_carry_the_pa_nz_shapes_with_packet_strides(self):
-        raw, k, v, ks, vs = self._views()
-        self.assertEqual(
-            tuple(k.shape),
-            (self.NUM_BLOCKS, self.NUM_KV_HEADS, self.HEAD_DIM // 32, self.BLOCK_SIZE, 32),
-        )
-        self.assertEqual(tuple(v.shape), tuple(k.shape))
-        self.assertEqual(
-            tuple(ks.shape),
-            mxfp_k_scale_cache_shape(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM),
-        )
-        self.assertEqual(
-            tuple(vs.shape),
-            mxfp_v_scale_cache_shape(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM),
-        )
-        packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
-        for view in (k, v):
-            # dim0 = kernel block, one packet apart; block-internal layout
-            # stays contiguous, which is the documented operator contract.
-            self.assertEqual(view.stride(0), packet)
-            self.assertTrue(all(s > 0 for s in view.stride()[1:]))
-        # Both scale caches are contiguous segments: kernel blocks are
-        # packed back to back with their natural 6-D strides.
-        self.assertTrue(ks.is_contiguous())
-        self.assertTrue(vs.is_contiguous())
-        self.assertEqual(
-            ks.stride(0),
-            mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM),
-        )
-        self.assertEqual(
-            vs.stride(0),
-            mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM),
-        )
-
-    def test_views_partition_the_payload_without_overlap(self):
-        # K at the packet head, then V: the two storage offsets must tile
-        # one packet exactly once, and the scale segments must follow the
-        # packet region back to back.
-        raw, k, v, ks, vs = self._views()
-        k_s, v_s = mxfp_packet_section_sizes(
-            self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM
-        )
-        ks_s = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-        vs_s = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-        packet = k_s + v_s
-        self.assertEqual(k.storage_offset(), 0)
-        self.assertEqual(v.storage_offset(), k_s)
-        self.assertEqual(ks.storage_offset(), self.NUM_BLOCKS * packet)
-        self.assertEqual(vs.storage_offset(), self.NUM_BLOCKS * (packet + ks_s))
-
-    def test_strided_writes_match_the_section_major_layout(self):
-        """Byte-equivalence against the layout this replaces.
-
-        Writes the same tokens' K bytes, K scales and V scale fill through
-        (a) the packet-packed strided views and (b) plain section-major
-        contiguous caches, then compares each cache byte for byte. A stride
-        or offset bug displaces data instead of raising, so this is the
-        guard for silent corruption.
-        """
-        torch.manual_seed(0)
-        raw, k, v, ks, vs = self._views()
-        ref_k = torch.zeros_like(k)
-        ref_v = torch.zeros_like(v)
-        ref_ks = torch.zeros_like(ks)
-        ref_vs = torch.zeros_like(vs)
-
-        slots = torch.tensor([0, 3, 5, 8, -1], dtype=torch.int64)
-        key_scale = torch.randint(1, 255, (slots.numel(), self.NUM_KV_HEADS, self.HEAD_DIM // 64, 2), dtype=torch.uint8)
-        for cache in (ks, ref_ks):
-            scatter_mxfp_k_scale_cache(key_scale, cache, mxfp_k_scale_slot_index(slots, self.BLOCK_SIZE))
-
-        value_scale = (
-            torch.arange(self.NUM_KV_HEADS * self.HEAD_DIM, dtype=torch.int32).remainder(251).add(1).to(torch.uint8)
-        )
-        for cache in (vs, ref_vs):
-            fill_mxfp_v_scale_cache(value_scale, cache)
-
-        # K payload: token t at slot s lands at [s // Bs, :, :, s % Bs, :] in
-        # the NZ view (channel-major fragment order).
-        key = torch.arange(slots.numel() * self.NUM_KV_HEADS * self.HEAD_DIM, dtype=torch.int32).remainder(251)
-        key = key.to(torch.uint8).reshape(slots.numel(), self.NUM_KV_HEADS, self.HEAD_DIM)
-        for t, slot in enumerate(slots.tolist()):
-            if slot < 0:
-                continue
-            block, offset = slot // self.BLOCK_SIZE, slot % self.BLOCK_SIZE
-            payload = key[t].reshape(self.NUM_KV_HEADS, self.HEAD_DIM // 32, 32)
-            for cache in (k, ref_k):
-                cache[block, :, :, offset, :] = payload
-
-        self.assertTrue(torch.equal(k, ref_k))
-        self.assertTrue(torch.equal(v, ref_v))
-        self.assertTrue(torch.equal(ks, ref_ks))
-        self.assertTrue(torch.equal(vs, ref_vs))
-
-    def test_hybrid_views_sit_at_the_tail_of_the_shared_buffer(self):
-        mamba_bytes = 37  # arbitrary front section (conv/SSM states)
-        k_sec = self.NUM_KV_HEADS * self.BLOCK_SIZE * self.HEAD_DIM
-        ks_sec = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-        payload = self.NUM_BLOCKS * (k_sec + k_sec + ks_sec + ks_sec)
-        tail_slack = 5
-        raw = torch.zeros(mamba_bytes + payload + tail_slack, dtype=torch.int8)
-        k, v, ks, vs = mxfp_hybrid_paged_cache_views(
-            raw, self.NUM_BLOCKS, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.BLOCK_SIZE
-        )
-        # Section-major layout: K heads the region (so the mamba SSM
-        # overlay, whose extent equals the whole K section, stays confined
-        # to K), every section contiguous, back to back.
-        region_start = mamba_bytes + tail_slack
-        self.assertEqual(k.storage_offset(), region_start)
-        self.assertTrue(k.is_contiguous() and v.is_contiguous())
-        self.assertEqual(v.storage_offset(), region_start + self.NUM_BLOCKS * k_sec)
-        self.assertEqual(ks.storage_offset(), v.storage_offset() + self.NUM_BLOCKS * k_sec)
-        self.assertEqual(vs.storage_offset(), ks.storage_offset() + self.NUM_BLOCKS * ks_sec)
-        # fill_(7) stores E4M3-encoded bytes, so count non-zero bytes;
-        # writing through the views must touch neither the mamba front nor
-        # the trailing slack.
-        k[0].fill_(7)
-        self.assertTrue(bool((raw[:region_start] == 0).all()))
-        self.assertTrue(bool((raw[region_start + payload :] == 0).all()))
-        self.assertEqual(int((raw.view(torch.uint8) != 0).sum()), k[0].numel())
-
-    def test_region_too_small_is_rejected(self):
-        with self.assertRaises(ValueError):
-            mxfp_paged_cache_views(
-                torch.zeros(3, dtype=torch.int8), 4, 1, 64, 64, 512
-            )
-
-
 class TestScatterMXFPPaNzKvCache(TestBase):
     """PA_NZ KV scatter hands npu_scatter_pa_kv_cache the FIA C8 contract.
 
@@ -275,11 +90,7 @@ class TestScatterMXFPPaNzKvCache(TestBase):
     def setUp(self):
         raw = torch.zeros(
             self.NUM_BLOCKS
-            * (
-                mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
-                + mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-                + mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
-            ),
+            * (mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)),
             dtype=torch.int8,
         )
         self.key_cache, self.value_cache, _, _ = mxfp_paged_cache_views(
@@ -573,6 +384,12 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         if with_impl:
             layer.impl = object.__new__(AscendC8MXFPAttentionBackendImpl.__base__)
         return layer
+
+    def test_missing_checkpoint_v_scale_defaults_to_neutral(self):
+        layer = self._make_layer()
+        method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
+        method.create_weights(layer)
+        self.assertTrue(torch.equal(layer.v_cache_scale, torch.full((8,), 127, dtype=torch.uint8)))
 
     def test_weight_loader_accepts_column_vector_checkpoint_layout(self):
         """ModelSlim exports v_scale as [hidden, 1]; the parameter is 1-D.

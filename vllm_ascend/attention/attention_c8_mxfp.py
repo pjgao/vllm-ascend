@@ -25,6 +25,10 @@ layout, scale-cache shapes, PA_NZ scatter/fill, strided view construction)
 shared by the backend and the model runner.
 """
 
+import math
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
 import torch
 import torch_npu
 from vllm.config import VllmConfig
@@ -45,18 +49,17 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.utils import uses_mooncake_connector
 
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden
 # reference: quant_flash_attn_golden.py "PA_NZ: fp8=[Bn,N,D//32,Bs,32],
 # Kscale=[Bn,N,Bs//16,D//64,16,2], Vscale=[Bn,N,D//16,Bs//64,16,2]"). The
-# caches are packet-packed: one [K | K_scale | V | V_scale] packet per
-# kernel block, packets laid out contiguously; every cache is a strided
-# view with dim0 = kernel block and dim0 stride = packet size (block-internal
-# bytes contiguous). This is the non-contiguous (block-strided) form both
-# operators document: the scatter tiling reads the dim0 stride as the block
-# stride and QFA accepts dim0-strided PA_NZ inputs. A scheduler block always
-# owns one contiguous byte range (its packets), so page-granularity CoW and
-# PD transfer stay correct. The trailing 2 packs the even/odd 32-element MX
-# scale groups (the native output format of npu_dynamic_mx_quant).
+# One kernel block owns [K | K_scale | V | V_scale | padding]. All four
+# views share the physical block pitch. Scale tensors retain their own
+# six-dimensional shape; operator stride support requires NPU validation.
+# The trailing 2 stores even/odd 32-element MX scale groups.
 # K scale token:  [num_tokens, num_kv_heads, head_dim // 64, 2]
 # K scale cache:  [num_blocks, num_kv_heads, block_size // 16, head_dim // 64, 16, 2]
 # V scale token (axis=0 quant): [cdiv(num_tokens, 64), num_kv_heads, head_dim, 2]
@@ -130,6 +133,8 @@ def mxfp_v_scale_cache_shape(
     num_kv_heads: int,
     head_dim: int,
 ) -> tuple[int, int, int, int, int, int]:
+    if head_dim <= 0 or head_dim % MXFP_KV_NZ_DIM_FRAG:
+        raise ValueError(f"MXFP V head_dim must be a positive multiple of 32, got {head_dim}.")
     return (
         num_blocks,
         num_kv_heads,
@@ -156,30 +161,35 @@ def mxfp_kv_page_size_bytes(
     return kv_bytes + scale_bytes
 
 
-def mxfp_packet_section_sizes(
-    num_kv_heads: int,
-    block_size: int,
-    k_dim: int,
-    v_dim: int,
-) -> tuple[int, int]:
-    """Section bytes of one kernel-block packet, in K/V order.
-
-    A packet is the per-kernel-block unit of the packet-packed layout: the
-    K payload (NZ order) and the V payload of one ``block_size``-token
-    kernel block stored back to back. Packets are laid out contiguously in
-    the attention payload region, so both cache views are strided views
-    with dim0 stride equal to the packet size (block-internal bytes stay
-    contiguous). Both scale caches live in their own contiguous segments
-    after the packet region.
-    """
-    k = num_kv_heads * block_size * k_dim
-    v = num_kv_heads * block_size * v_dim
-    return k, v
+def mxfp_packet_section_sizes(num_kv_heads: int, block_size: int, k_dim: int, v_dim: int) -> tuple[int, int, int, int]:
+    """Byte sizes in physical order: K, K_scale, V, V_scale."""
+    if num_kv_heads <= 0:
+        raise ValueError("MXFP cache requires at least one KV head.")
+    mxfp_v_scale_cache_shape(1, block_size, num_kv_heads, v_dim)
+    return (
+        num_kv_heads * block_size * k_dim,
+        mxfp_k_scale_page_bytes(num_kv_heads, block_size, k_dim),
+        num_kv_heads * block_size * v_dim,
+        mxfp_v_scale_page_bytes(num_kv_heads, block_size, v_dim),
+    )
 
 
 def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim: int) -> int:
-    """Total bytes of one kernel-block packet (K + V)."""
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
+
+
+def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
+    """Budget scales through upstream state_content_bytes, preserving real D."""
+    k_dim, v_dim = spec.head_size, spec.head_size_v
+    if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
+        raise ValueError("MXFP cache requires one stored state per token and one slot per KV head.")
+    mxfp_packet_section_sizes(spec.num_kv_heads, spec.block_size, k_dim, v_dim)
+    result = replace(
+        spec, dtype=torch.float8_e4m3fn, state_content_bytes=k_dim + v_dim + (k_dim + v_dim) // MXFP8_GROUP_SIZE
+    )
+    if result.page_size_padded is not None and result.page_size_padded < result.unpadded_page_size_bytes:
+        raise ValueError("MXFP padded page is smaller than its K/V and scale payload.")
+    return result
 
 
 def mxfp_paged_cache_views(
@@ -189,79 +199,56 @@ def mxfp_paged_cache_views(
     k_dim: int,
     v_dim: int,
     block_size: int,
+    *,
+    page_stride_bytes: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the (k, v, k_scale, v_scale) cache views over a packet-packed region.
-
-    ``raw_tensor`` is a 1-D int8 view positioned at the first packet of the
-    region. K and V are dim0-strided views (dim0 = kernel block id, dim0
-    stride = packet size) over the per-kernel-block [K | V] packets; the
-    K-scale and V-scale caches are contiguous 6-D segments that follow the
-    packet region. The 5-D shapes and their in-packet strides match the
-    contiguous layout byte for byte, which is what the QFA operator's
-    documented dim0-stride support and the scatter operator's block-stride
-    tiling consume.
-    """
-    assert raw_tensor.dim() == 1 and raw_tensor.dtype == torch.int8
-    k_size, v_size = mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim)
-    k_scale_size = mxfp_k_scale_page_bytes(num_kv_heads, block_size, k_dim)
-    v_scale_size = mxfp_v_scale_page_bytes(num_kv_heads, block_size, v_dim)
-    packet_size = k_size + v_size
-    payload_size = num_kernel_blocks * (packet_size + k_scale_size + v_scale_size)
-    if raw_tensor.numel() < payload_size:
-        raise ValueError(
-            "C8_MXFP packet-packed cache region is too small: "
-            f"raw_numel={raw_tensor.numel()}, "
-            f"required={payload_size}."
+    """Construct four views without allocating a temporary cache tensor."""
+    if raw_tensor.ndim != 1 or raw_tensor.dtype != torch.int8 or raw_tensor.stride(0) != 1:
+        raise ValueError("MXFP raw cache must be a contiguous 1-D int8 view.")
+    if num_kernel_blocks <= 0:
+        raise ValueError("MXFP cache requires at least one kernel block.")
+    k_bytes, ks_bytes, v_bytes, vs_bytes = mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim)
+    payload_bytes = k_bytes + ks_bytes + v_bytes + vs_bytes
+    pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
+    if pitch < payload_bytes or raw_tensor.numel() < num_kernel_blocks * pitch:
+        raise ValueError("MXFP raw cache or physical page pitch is smaller than the payload.")
+    shapes = (
+        (num_kernel_blocks, num_kv_heads, k_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
+        (num_kernel_blocks, num_kv_heads, v_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
+        mxfp_k_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, k_dim),
+        mxfp_v_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, v_dim),
+    )
+    offsets = (0, k_bytes + ks_bytes, k_bytes, k_bytes + ks_bytes + v_bytes)
+    dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.uint8, torch.uint8)
+    views = []
+    for shape, offset, dtype in zip(shapes, offsets, dtypes):
+        # All elements are one byte. as_strided uses an absolute storage offset,
+        # even when raw_tensor is a slice of an aligned/shared allocation.
+        strides = (pitch, *(math.prod(shape[i + 1 :]) for i in range(1, len(shape))))
+        views.append(
+            torch.as_strided(
+                raw_tensor.view(dtype), shape, strides, storage_offset=raw_tensor.storage_offset() + offset
+            )
         )
+    return tuple(views)
 
-    def _view(shape: tuple[int, ...], dtype: torch.dtype, offset: int) -> torch.Tensor:
-        # as_strided's storage_offset is absolute within the underlying
-        # storage; raw_tensor may itself be a slice of a shared hybrid
-        # buffer, so add its own offset (all dtypes here are 1 byte).
-        base = raw_tensor.view(dtype)
-        inner = torch.empty(shape).stride()
-        return torch.as_strided(
-            base,
-            size=shape,
-            stride=(packet_size, *inner[1:]),
-            storage_offset=base.storage_offset() + offset,
-        )
 
-    k_shape = (
-        num_kernel_blocks,
-        num_kv_heads,
-        k_dim // MXFP_KV_NZ_DIM_FRAG,
-        block_size,
-        MXFP_KV_NZ_DIM_FRAG,
-    )
-    v_shape = (
-        num_kernel_blocks,
-        num_kv_heads,
-        v_dim // MXFP_KV_NZ_DIM_FRAG,
-        block_size,
-        MXFP_KV_NZ_DIM_FRAG,
-    )
-    k_scale_shape = mxfp_k_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, k_dim)
-    v_scale_shape = mxfp_v_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, v_dim)
-    # Both scale segments sit contiguously after the packet region; plain
-    # slice+view keeps their natural 6-D strides.
-    scales_start = num_kernel_blocks * packet_size
-    k_scale = (
-        raw_tensor[scales_start : scales_start + num_kernel_blocks * k_scale_size]
-        .view(torch.uint8)
-        .view(k_scale_shape)
-    )
-    vs_start = scales_start + num_kernel_blocks * k_scale_size
-    v_scale = (
-        raw_tensor[vs_start : vs_start + num_kernel_blocks * v_scale_size]
-        .view(torch.uint8)
-        .view(v_scale_shape)
-    )
-    return (
-        _view(k_shape, torch.float8_e4m3fn, 0),
-        _view(v_shape, torch.float8_e4m3fn, k_size),
-        k_scale,
-        v_scale,
+def mxfp_cache_views_for_spec(raw_tensor: torch.Tensor, spec: "FullAttentionSpec", kernel_block_size: int):
+    """Translate scheduler pages (including padding) into kernel block views."""
+    if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
+        raise ValueError("MXFP scheduler block must contain a whole number of kernel blocks.")
+    ratio = spec.block_size // kernel_block_size
+    page_bytes = spec.page_size_bytes
+    if page_bytes % ratio or raw_tensor.numel() % page_bytes:
+        raise ValueError("MXFP raw allocation and physical pitch must contain whole pages.")
+    return mxfp_paged_cache_views(
+        raw_tensor,
+        raw_tensor.numel() // page_bytes * ratio,
+        spec.num_kv_heads,
+        spec.head_size,
+        spec.head_size_v,
+        kernel_block_size,
+        page_stride_bytes=page_bytes // ratio,
     )
 
 
@@ -382,58 +369,6 @@ def scatter_mxfp_k_scale_cache(
     if block_ids.numel() == 0:
         return
     key_scale_cache[block_ids, :, seg_ids, :, frag_ids, :] = key_scale
-
-
-def mxfp_hybrid_paged_cache_views(
-    raw_tensor: torch.Tensor,
-    num_kernel_blocks: int,
-    num_kv_heads: int,
-    k_dim: int,
-    v_dim: int,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the section-major C8 MXFP views over a hybrid buffer's attention tail.
-
-    Hybrid cache groups share one padded raw buffer between Mamba and
-    full-attention layers. The overlay places the mamba SSM state over the
-    front of the attention payload, and the block-size alignment
-    (one SSM slot spans the same bytes as one scheduler block of K) makes
-    that overlay zone exactly as large as the whole K section. Keeping K
-    as the first section confines the overlay to K, which the per-step
-    scatter fully rewrites; V and both scale caches sit behind the K
-    section, outside the overlay zone. All four sections are stored
-    directly in their PA_NZ operator layouts (no boundary re-viewing), so
-    scatter and QFA consume the views as-is. Each section is contiguous,
-    so block-granularity CoW/transfer copy per section slice.
-    """
-    section_sizes = [
-        num_kv_heads * block_size * k_dim,
-        num_kv_heads * block_size * v_dim,
-        mxfp_k_scale_page_bytes(num_kv_heads, block_size, k_dim),
-        mxfp_v_scale_page_bytes(num_kv_heads, block_size, v_dim),
-    ]
-    payload_size = num_kernel_blocks * sum(section_sizes)
-    if raw_tensor.numel() < payload_size:
-        raise ValueError(
-            "C8_MXFP hybrid cache buffer is too small: "
-            f"raw_numel={raw_tensor.numel()}, payload_numel={payload_size} "
-            f"({num_kernel_blocks} blocks per section)."
-        )
-    region = raw_tensor[raw_tensor.numel() - payload_size :]
-    shapes = (
-        (num_kernel_blocks, num_kv_heads, k_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
-        (num_kernel_blocks, num_kv_heads, v_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
-        mxfp_k_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, k_dim),
-        mxfp_v_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, v_dim),
-    )
-    dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.uint8, torch.uint8)
-    views = []
-    offset = 0
-    for size, shape, dtype in zip(section_sizes, shapes, dtypes):
-        section = region[offset : offset + num_kernel_blocks * size]
-        views.append(section.view(dtype).view(shape))
-        offset += num_kernel_blocks * size
-    return tuple(views)
 
 
 class AscendC8MXFPAttentionBackend(AscendAttentionBackend):

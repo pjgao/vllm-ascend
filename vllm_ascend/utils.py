@@ -786,7 +786,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
     from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
     from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
-    from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
     from vllm_ascend.ops.layernorm import AscendFusedRMSNormGated, AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
         AscendColumnParallelLinear,
@@ -802,6 +801,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.rotary_embedding import (
         AscendApplyRotaryEmb,
         AscendDeepseekScalingRotaryEmbedding,
+        AscendGemma4RotaryEmbedding,
         AscendMRotaryEmbedding,
         AscendRotaryEmbedding,
         AscendYaRNRotaryEmbedding,
@@ -818,6 +818,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "SiluAndMul": AscendSiluAndMul,
         "SiluAndMulClamp": AscendSiluAndMulWithClamp,
         "RotaryEmbedding": AscendRotaryEmbedding,
+        "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
         "MRotaryEmbedding": AscendMRotaryEmbedding,
         "ColumnParallelLinear": AscendColumnParallelLinear,
         "RowParallelLinear": AscendRowParallelLinear,
@@ -839,7 +840,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "Conv3dLayer": AscendConv3dLayer,
         "RelPosAttention": AscendRelPosAttention,
         "CustomQwen2Decoder": AscendCustomQwen2Decoder,
-        "GatedDeltaNetAttention": AscendGatedDeltaNetAttention,
         "BailingMoELinearAttention": AscendBailingMoELinearAttention,
         "MoERunner": AscendMoERunner,
         "RoutedExperts": AscendRoutedExperts,
@@ -892,6 +892,11 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "RoutedExperts": AscendRoutedExperts310,
             }
         )
+    else:
+        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+        REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
+
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
 
@@ -1327,22 +1332,14 @@ def refresh_block_size(vllm_config):
     if cache_config.block_size is None:
         cache_config.block_size = 128
 
-    # Reuse the hybrid config hook's layout calculation after cache settings
-    # are finalized; dense C8-MXFP caches use the kernel block size.
+    # Hybrid page padding is handled by the upstream cache planner. C8 only
+    # constrains the scheduler block to contain whole 512-token kernel blocks.
     if is_c8_mxfp_kv_quant(vllm_config):
-        if model_config is not None and model_config.is_hybrid:
-            from vllm_ascend.patch.platform.patch_mamba_config import update_hybrid_cache_layout
-
-            update_hybrid_cache_layout(vllm_config)
-        elif cache_config.block_size != A5_C8_MXFP_KV_CACHE_BLOCK_SIZE:
+        kernel_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
+        if cache_config.block_size % kernel_size:
             if getattr(cache_config, "user_specified_block_size", False):
-                raise ValueError(f"C8_MXFP currently supports --block-size 512; got {cache_config.block_size}.")
-            logger.info(
-                "Ascend A5 with C8_MXFP KV cache requires block_size=%s; overriding block_size from %s.",
-                A5_C8_MXFP_KV_CACHE_BLOCK_SIZE,
-                cache_config.block_size,
-            )
-            cache_config.block_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
+                raise ValueError(f"C8_MXFP requires --block-size to be a multiple of {kernel_size}.")
+            cache_config.block_size = kernel_size
         return
 
     if not scheduler_config or not model_config:
@@ -1808,3 +1805,14 @@ def use_updatable_graph(
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
     return attn_backend is not None and issubclass(attn_backend, AscendAttentionBackend)
+
+
+def _is_glm_model(model_config) -> bool:
+    """Return True if the target model belongs to the GLM series.
+
+    Detection is based on the model_type string (covers glm, chatglm, glm4,
+    glm4_moe, glm4_moe_lite, glm4_1v, glm_ocr, glm_moe_dsa, etc).
+    """
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_text_config, "model_type", "") or ""
+    return "glm" in str(model_type).lower()
