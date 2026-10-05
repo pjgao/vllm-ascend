@@ -6,7 +6,7 @@ no C8 allocation adaptation in this branch.
 
 The source is AJF-cmd's `qfa_c8_paged` at
 `42f8de515dd3b237013a2093696736f77c723e58`. Official `main` is merged at
-`7df96048756856e4d30f29618129e9942ba6985c`, including
+`7c67bcce3bf750c5c762221e321976d26c551b49`, including
 [PR #14340](https://github.com/vllm-project/vllm-ascend/pull/14340).
 The upstream vLLM interface is the `ced6857afa` version used by that main.
 
@@ -100,6 +100,9 @@ same contiguous K-then-V layout.
 CPU regression coverage checks scale budgets, real dimensions, nonzero
 storage offsets, padding, 1/2/8 kernel blocks per scheduler block, cyclic
 copies, and clear ranges that preserve V scales and allocation guards.
+The Windows CPU validation passed 123 tests (plus three subtests), using
+the production definitions and pinned upstream spec classes with unavailable
+vLLM/NPU imports isolated. This is not a complete installed-vLLM test run.
 
 The A5/CANN test
 `tests/e2e/nightly/single_node/ops/singlecard_ops/test_qfa_c8_paged_layout.py`
