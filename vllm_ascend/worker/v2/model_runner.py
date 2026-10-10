@@ -349,6 +349,48 @@ class NPUModelRunner(GPUModelRunner):
             shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
         )
 
+    def _init_kv_zero_meta(self) -> None:
+        # The upstream CUDA zeroer cannot consume Ascend's K/V packet views.
+        # Worker invokes this after initialization, so retain the C8 wrapper.
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        from vllm_ascend.attention.attention_c8_mxfp import fill_mxfp_v_scale_cache
+        from vllm_ascend.worker.c8_cache import C8KVBlockZeroer
+        from vllm_ascend.worker.utils import AscendKVBlockZeroer
+
+        zeroer = AscendKVBlockZeroer(self.device, is_pin_memory_available())
+        zeroer.init_meta(
+            (group for groups in self.attn_groups for group in groups),
+            self.kernel_block_sizes,
+            self.cache_config.cache_dtype,
+            set(),
+            self.compilation_config.static_forward_context,
+        )
+        entries = getattr(self, "_c8_mxfp_v_scale_caches", ())
+        self.kv_block_zeroer = C8KVBlockZeroer(zeroer, entries, fill_mxfp_v_scale_cache) if entries else zeroer
+
+    def _register_c8_scale_caches(self, kv_caches: dict[str, Any]) -> None:
+        # Run after the final cache views have been bound, before any warmup.
+        from vllm_ascend.attention.attention_c8_mxfp import (
+            AscendC8MXFPAttentionBackendImpl,
+            fill_mxfp_v_scale_cache,
+        )
+        from vllm_ascend.worker.c8_cache import C8KVBlockZeroer, register_c8_scale_caches
+
+        entries = register_c8_scale_caches(
+            kv_caches,
+            self.compilation_config.static_forward_context,
+            self.kv_cache_config.num_blocks,
+            AscendC8MXFPAttentionBackendImpl,
+            fill_mxfp_v_scale_cache,
+        )
+        self._c8_mxfp_v_scale_caches = entries
+        if entries:
+            delegate = self.kv_block_zeroer
+            if isinstance(delegate, C8KVBlockZeroer):
+                delegate = delegate.delegate
+            self.kv_block_zeroer = C8KVBlockZeroer(delegate, entries, fill_mxfp_v_scale_cache)
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
