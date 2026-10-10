@@ -58,6 +58,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
+from vllm_ascend.attention.attention_c8_mxfp import mxfp_cache_spec, mxfp_cache_views_for_spec
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
@@ -93,6 +94,7 @@ from vllm_ascend.utils import (
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
     get_kv_cache_tensor_layers,
+    is_c8_mxfp_kv_quant,
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_packed_sfa_main_cache,
 )
@@ -221,6 +223,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             # updates rely on this stable backend ordering.
             mamba_specs[layer_name] = spec
             continue
+
+        # Exclude subclasses such as MLA, which use a different cache layout.
+        if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+            spec = mxfp_cache_spec(spec)
 
         if isinstance(attn_module, MLAAttention):
             cache_sparse_sfa_c8 = False
@@ -1161,6 +1167,11 @@ def _allocate_kv_cache(
                 if type(layer_spec) is not FullAttentionSpec:
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
+                if is_c8_mxfp_kv_quant(vllm_config):
+                    # C8 uses one packet-backed allocation, including both
+                    # scale sections. Never split it into generic K/V buffers.
+                    kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
+                    continue
                 if attn_layers is None:
                     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
                 layer = attn_layers.get(layer_name)
@@ -1353,6 +1364,16 @@ def _reshape_kv_cache_v2(
                 continue
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+            # Exclude subclasses such as MLA, which use a different cache layout.
+            if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+                raw_cache = kv_cache_raw_tensors[layer_name]
+                if not isinstance(raw_cache, torch.Tensor):
+                    raise ValueError("MXFP KV cache requires one combined raw allocation per layer.")
+                # These views preserve the shared allocation's storage offset
+                # and the padded physical-page pitch, including virtual blocks.
+                kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                continue
 
             if layer_name in layer_tuple_strides:
                 # Same view construction as model_runner_v1

@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any
@@ -120,6 +121,33 @@ from vllm_ascend.worker.v2.utils import (
     prepare_v41_source_rope,
     torch_cuda_wrapper,
 )
+
+
+class C8KVBlockZeroer:
+    """Restore static V scales after zeroing and before upstream block copies."""
+
+    def __init__(self, delegate: Any, entries: list[tuple[Any, Any, int]], fill: Callable) -> None:
+        self.delegate = delegate
+        self.entries = entries
+        self.fill = fill
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    def zero_block_ids(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        # Validate the entire batch before any device write.
+        for _, cache, ratio in self.entries:
+            for block_id in block_ids:
+                if block_id < 0 or block_id >= cache.shape[0] // ratio:
+                    raise IndexError(f"C8 physical block ID out of range: {block_id}")
+        if self.delegate is not None:
+            self.delegate.zero_block_ids(block_ids)
+        for scale, cache, ratio in self.entries:
+            for block_id in block_ids:
+                start = block_id * ratio
+                self.fill(scale, cache[start : start + ratio])
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -349,6 +377,61 @@ class NPUModelRunner(GPUModelRunner):
             shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
         )
 
+    def _init_kv_zero_meta(self) -> None:
+        # The upstream CUDA zeroer cannot consume Ascend's K/V packet views.
+        # Worker invokes this after initialization, so retain the C8 wrapper.
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        from vllm_ascend.attention.attention_c8_mxfp import fill_mxfp_v_scale_cache
+        from vllm_ascend.worker.utils import AscendKVBlockZeroer
+
+        zeroer = AscendKVBlockZeroer(self.device, is_pin_memory_available())
+        zeroer.init_meta(
+            (group for groups in self.attn_groups for group in groups),
+            self.kernel_block_sizes,
+            self.cache_config.cache_dtype,
+            set(),
+            self.compilation_config.static_forward_context,
+        )
+        entries = getattr(self, "_c8_mxfp_v_scale_caches", ())
+        self.kv_block_zeroer = C8KVBlockZeroer(zeroer, entries, fill_mxfp_v_scale_cache) if entries else zeroer
+
+    def shutdown(self) -> None:
+        # Drop packet views before the parent collects tensors and empties
+        # the allocator cache. Clear in place for any retained wrapper aliases.
+        entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
+        if entries is not None:
+            entries.clear()
+        zeroer = getattr(self, "kv_block_zeroer", None)
+        if isinstance(zeroer, C8KVBlockZeroer):
+            zeroer.entries.clear()
+            self.kv_block_zeroer = zeroer.delegate
+        super().shutdown()
+
+    def _register_c8_scale_caches(self) -> None:
+        # Run after the final cache views have been bound, before any warmup.
+        from vllm_ascend.attention.attention_c8_mxfp import (
+            AscendC8MXFPAttentionBackendImpl,
+            fill_mxfp_v_scale_cache,
+        )
+
+        entries = []
+        num_blocks = self.kv_cache_config.num_blocks
+        for layer in self.compilation_config.static_forward_context.values():
+            if not isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
+                continue
+            cache = layer.kv_cache[3]
+            if num_blocks <= 0 or cache.shape[0] % num_blocks or cache.shape[0] < num_blocks:
+                raise ValueError("C8 V-scale cache must contain whole physical pages")
+            entries.append((layer.v_cache_scale, cache, cache.shape[0] // num_blocks))
+            fill_mxfp_v_scale_cache(layer.v_cache_scale, cache)
+        self._c8_mxfp_v_scale_caches = entries
+        if entries:
+            delegate = self.kv_block_zeroer
+            if isinstance(delegate, C8KVBlockZeroer):
+                delegate = delegate.delegate
+            self.kv_block_zeroer = C8KVBlockZeroer(delegate, entries, fill_mxfp_v_scale_cache)
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -387,6 +470,7 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+            self._register_c8_scale_caches()
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
