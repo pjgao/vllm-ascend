@@ -2,7 +2,6 @@
 """CPU packet-view regression harness; no vLLM/NPU initialization needed."""
 
 import ast
-import importlib.util
 import weakref
 from contextlib import nullcontext
 from pathlib import Path
@@ -12,9 +11,6 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[4]
-SPEC = importlib.util.spec_from_file_location("c8_cache_lifecycle", ROOT / "vllm_ascend/worker/c8_cache.py")
-MODULE = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MODULE)
 # Execute the real fill function, avoiding Ascend module import side effects.
 TREE = ast.parse((ROOT / "vllm_ascend/attention/attention_c8_mxfp.py").read_text())
 FUNC = next(node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name == "fill_mxfp_v_scale_cache")
@@ -27,6 +23,36 @@ class C8Impl:
     pass
 
 
+RUNNER_TREE = ast.parse((ROOT / "vllm_ascend/worker/v2/model_runner.py").read_text())
+ZEROER = next(node for node in RUNNER_TREE.body if isinstance(node, ast.ClassDef) and node.name == "C8KVBlockZeroer")
+RUNNER = next(node for node in RUNNER_TREE.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+REGISTER = next(
+    node for node in RUNNER.body if isinstance(node, ast.FunctionDef) and node.name == "_register_c8_scale_caches"
+)
+REGISTER.body = [node for node in REGISTER.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+LIFECYCLE = {
+    "Any": object,
+    "Callable": object,
+    "AscendC8MXFPAttentionBackendImpl": C8Impl,
+    "fill_mxfp_v_scale_cache": FILL,
+}
+exec(compile(ast.Module(body=[ZEROER, REGISTER], type_ignores=[]), "model_runner.py", "exec"), LIFECYCLE)
+MODULE = SimpleNamespace(C8KVBlockZeroer=LIFECYCLE["C8KVBlockZeroer"])
+
+
+def register(caches, layers, num_blocks):
+    for name, cache in caches.items():
+        if name in layers:
+            layers[name].kv_cache = cache
+    state = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers),
+        kv_cache_config=SimpleNamespace(num_blocks=num_blocks),
+        kv_block_zeroer=None,
+    )
+    LIFECYCLE["_register_c8_scale_caches"](state)
+    return state._c8_mxfp_v_scale_caches
+
+
 def packet():
     # Two 512-token kernel blocks per physical page; PA_NZ6D V scales
     # occupy a subsection of a packet containing other K/V/scale bytes.
@@ -34,7 +60,7 @@ def packet():
     view = raw.as_strided((6, 1, 1, 8, 16, 2), (704, 256, 256, 32, 2, 1), 71)
     scale = torch.arange(110, 126, dtype=torch.uint8)
     layer = SimpleNamespace(impl=C8Impl(), v_cache_scale=scale)
-    entries = MODULE.register_c8_scale_caches({"fa": (None, None, None, view)}, {"fa": layer}, 3, C8Impl, FILL)
+    entries = register({"fa": (None, None, None, view)}, {"fa": layer}, 3)
     return raw, view, scale, entries
 
 
@@ -144,15 +170,13 @@ def test_missing_zeroer_still_restores_and_empty_ids_noop():
 def test_non_c8_unchanged_and_invalid_page_ratio_rejected():
     raw, view, scale, _ = packet()
     before = raw.clone()
-    assert MODULE.register_c8_scale_caches({"bf16": view}, {}, 3, C8Impl, FILL) == []
+    assert register({"bf16": view}, {}, 3) == []
     assert torch.equal(raw, before)
     with pytest.raises(ValueError):
-        MODULE.register_c8_scale_caches(
+        register(
             {"fa": (None, None, None, view)},
             {"fa": SimpleNamespace(impl=C8Impl(), v_cache_scale=scale)},
             4,
-            C8Impl,
-            FILL,
         )
 
 
@@ -288,7 +312,6 @@ def test_runner_registers_bound_target_and_draft_caches_without_patch_hook():
         "AbstractContextManager": object,
         "AscendC8MXFPAttentionBackendImpl": C8Impl,
         "C8KVBlockZeroer": MODULE.C8KVBlockZeroer,
-        "register_c8_scale_caches": MODULE.register_c8_scale_caches,
         "fill_mxfp_v_scale_cache": FILL,
     }
     exec(
