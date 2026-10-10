@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU packet-view regression harness; no vLLM/NPU initialization needed."""
+
 import ast
 import importlib.util
 from pathlib import Path
@@ -51,16 +52,20 @@ def test_reassigned_page_zero_restore_then_copy(has_meta):
     raw[2 * 704 : 4 * 704 + 71].zero_()  # previous hybrid state owner
     before = view.clone()
     events = []
+
     class Zeroer:
         _meta = object() if has_meta else None
+
         def zero_block_ids(self, ids):
             events.append("zero")
             if self._meta is not None:
                 for block in ids:
                     view[block * 2 : block * 2 + 2].zero_()
+
     def fill(source, target):
         events.append("restore")
         FILL(source, target)
+
     zeroer = MODULE.C8KVBlockZeroer(Zeroer(), entries, fill)
     zeroer.zero_block_ids([1])
     assert torch.equal(view[2:4], scale.view(1, 1, 1, 16, 1).expand_as(view[2:4]))
@@ -90,31 +95,93 @@ def test_non_c8_unchanged_and_invalid_page_ratio_rejected():
     assert MODULE.register_c8_scale_caches({"bf16": view}, {}, 3, C8Impl, FILL) == []
     assert torch.equal(raw, before)
     with pytest.raises(ValueError):
-        MODULE.register_c8_scale_caches({"fa": (None, None, None, view)},
-            {"fa": SimpleNamespace(impl=C8Impl(), v_cache_scale=scale)}, 4, C8Impl, FILL)
+        MODULE.register_c8_scale_caches(
+            {"fa": (None, None, None, view)},
+            {"fa": SimpleNamespace(impl=C8Impl(), v_cache_scale=scale)},
+            4,
+            C8Impl,
+            FILL,
+        )
+
+
+@pytest.mark.parametrize("block_ids", [[-1], [3], [0, 3]])
+@pytest.mark.parametrize("has_delegate", [True, False])
+def test_invalid_ids_rejected_before_any_write(block_ids, has_delegate):
+    raw, _, _, entries = packet()
+    before = raw.clone()
+    events = []
+
+    class Zeroer:
+        def zero_block_ids(self, ids):
+            events.append("zero")
+            raw.zero_()
+
+    def fill(source, target):
+        events.append("restore")
+        FILL(source, target)
+
+    zeroer = MODULE.C8KVBlockZeroer(Zeroer() if has_delegate else None, entries, fill)
+    with pytest.raises(IndexError):
+        zeroer.zero_block_ids(block_ids)
+    assert events == []
+    assert torch.equal(raw, before)
+
+
+def test_all_cache_entries_validated_before_any_write():
+    raw, view, scale, entries = packet()
+    before = raw.clone()
+    events = []
+    entries.append((scale, view[:2], 2))
+
+    class Zeroer:
+        def zero_block_ids(self, ids):
+            events.append("zero")
+
+    def fill(source, target):
+        events.append("restore")
+        FILL(source, target)
+
+    with pytest.raises(IndexError):
+        MODULE.C8KVBlockZeroer(Zeroer(), entries, fill).zero_block_ids([0, 1])
+    assert events == []
+    assert torch.equal(raw, before)
 
 
 def test_worker_zero_meta_reinitialization_keeps_restore_wrapper():
     _, view, scale, entries = packet()
     tree = ast.parse((ROOT / "vllm_ascend/worker/v2/model_runner.py").read_text())
     runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
-    method = next(node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "_init_kv_zero_meta")
+    method = next(
+        node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "_init_kv_zero_meta"
+    )
     method.body = [node for node in method.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+
     class Zeroer:
         def __init__(self, device, pin):
             self._meta = None
+
         def init_meta(self, *args):
             self.args = args
+
         def zero_block_ids(self, ids):
             pass
-    namespace = {"AscendKVBlockZeroer": Zeroer, "C8KVBlockZeroer": MODULE.C8KVBlockZeroer,
-                 "fill_mxfp_v_scale_cache": FILL, "is_pin_memory_available": lambda: False}
+
+    namespace = {
+        "AscendKVBlockZeroer": Zeroer,
+        "C8KVBlockZeroer": MODULE.C8KVBlockZeroer,
+        "fill_mxfp_v_scale_cache": FILL,
+        "is_pin_memory_available": lambda: False,
+    }
     exec(compile(ast.Module(body=[method], type_ignores=[]), "model_runner.py", "exec"), namespace)
-    state = SimpleNamespace(device="cpu", attn_groups=[], kernel_block_sizes=[512],
+    state = SimpleNamespace(
+        device="cpu",
+        attn_groups=[],
+        kernel_block_sizes=[512],
         cache_config=SimpleNamespace(cache_dtype="mxfp8"),
         compilation_config=SimpleNamespace(static_forward_context={}),
         _c8_mxfp_v_scale_caches=entries,
-        kv_block_zeroer=MODULE.C8KVBlockZeroer(None, entries, FILL))
+        kv_block_zeroer=MODULE.C8KVBlockZeroer(None, entries, FILL),
+    )
     namespace["_init_kv_zero_meta"](state)
     assert isinstance(state.kv_block_zeroer, MODULE.C8KVBlockZeroer)
     assert isinstance(state.kv_block_zeroer.delegate, Zeroer)
