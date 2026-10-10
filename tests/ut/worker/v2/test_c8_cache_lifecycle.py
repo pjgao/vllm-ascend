@@ -4,6 +4,7 @@
 import ast
 import importlib.util
 import weakref
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -239,3 +240,68 @@ def test_worker_zero_meta_reinitialization_keeps_restore_wrapper():
     view[2:4].zero_()
     state.kv_block_zeroer.zero_block_ids([1])
     assert torch.equal(view[2:4], scale.view(1, 1, 1, 16, 1).expand_as(view[2:4]))
+
+
+def test_runner_registers_bound_target_and_draft_caches_without_patch_hook():
+    tree = ast.parse((ROOT / "vllm_ascend/worker/v2/model_runner.py").read_text())
+    runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+    register = next(
+        node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "_register_c8_scale_caches"
+    )
+    register.body = [node for node in register.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+    initialize = next(
+        node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "initialize_kv_cache"
+    )
+    # Execute the actual parent-init and registration statements in their
+    # source order, isolating unrelated PD/PCP initialization from this fixture.
+    block = next(node for node in initialize.body if isinstance(node, ast.With))
+    initialize.body = block.body[:2]
+    initialize.decorator_list = []
+    _, target, target_scale, _ = packet()
+    _, draft, draft_scale, _ = packet()
+    target.zero_()
+    draft.zero_()
+    layers = {
+        "target": SimpleNamespace(impl=C8Impl(), v_cache_scale=target_scale),
+        "draft": SimpleNamespace(impl=C8Impl(), v_cache_scale=draft_scale),
+        "gdn": SimpleNamespace(impl=object()),
+        "unrelated": object(),
+    }
+
+    class Parent:
+        def initialize_kv_cache(self, config, **kwargs):
+            self.kv_cache_config = config
+            layers["target"].kv_cache = (None, None, None, target)
+            layers["draft"].kv_cache = (None, None, None, draft)
+
+    child = ast.ClassDef(
+        name="Runner",
+        bases=[ast.Name(id="Parent", ctx=ast.Load())],
+        keywords=[],
+        body=[register, initialize],
+        decorator_list=[],
+    )
+    namespace = {
+        "Parent": Parent,
+        "Any": object,
+        "KVCacheConfig": object,
+        "AbstractContextManager": object,
+        "AscendC8MXFPAttentionBackendImpl": C8Impl,
+        "C8KVBlockZeroer": MODULE.C8KVBlockZeroer,
+        "register_c8_scale_caches": MODULE.register_c8_scale_caches,
+        "fill_mxfp_v_scale_cache": FILL,
+    }
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[child], type_ignores=[])), "model_runner.py", "exec"),
+        namespace,
+    )
+    state = namespace["Runner"]()
+    state.compilation_config = SimpleNamespace(static_forward_context=layers)
+    state.kv_block_zeroer = None
+    state.initialize_kv_cache(SimpleNamespace(num_blocks=3), nullcontext())
+    assert len(state._c8_mxfp_v_scale_caches) == 2
+    assert state.kv_block_zeroer.entries is state._c8_mxfp_v_scale_caches
+    for view, scale in ((target, target_scale), (draft, draft_scale)):
+        assert torch.equal(view, scale.view(1, 1, 1, 16, 1).expand_as(view))
+    patch_tree = ast.parse((ROOT / "vllm_ascend/patch/worker/patch_v2/patch_model_runner.py").read_text())
+    assert "_register_c8_scale_caches" not in ast.unparse(patch_tree)

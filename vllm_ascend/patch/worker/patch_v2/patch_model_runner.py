@@ -192,9 +192,6 @@ def initialize_kv_cache(
             kv_cache_allocation_context=kv_cache_allocation_context,
             block_tables=self.block_tables,
         )
-    register_c8_scale_caches = getattr(self, "_register_c8_scale_caches", None)
-    if register_c8_scale_caches is not None:
-        register_c8_scale_caches(kv_caches_dict)
     register_sparse_kv_caches = getattr(self, "_register_sparse_kv_caches", None)
     if register_sparse_kv_caches is not None:
         register_sparse_kv_caches(kv_caches_dict)

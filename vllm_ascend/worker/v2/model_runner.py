@@ -383,7 +383,7 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_block_zeroer = zeroer.delegate
         super().shutdown()
 
-    def _register_c8_scale_caches(self, kv_caches: dict[str, Any]) -> None:
+    def _register_c8_scale_caches(self) -> None:
         # Run after the final cache views have been bound, before any warmup.
         from vllm_ascend.attention.attention_c8_mxfp import (
             AscendC8MXFPAttentionBackendImpl,
@@ -391,9 +391,15 @@ class NPUModelRunner(GPUModelRunner):
         )
         from vllm_ascend.worker.c8_cache import C8KVBlockZeroer, register_c8_scale_caches
 
+        layers = self.compilation_config.static_forward_context
+        kv_caches = {
+            name: layer.kv_cache
+            for name, layer in layers.items()
+            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl)
+        }
         entries = register_c8_scale_caches(
             kv_caches,
-            self.compilation_config.static_forward_context,
+            layers,
             self.kv_cache_config.num_blocks,
             AscendC8MXFPAttentionBackendImpl,
             fill_mxfp_v_scale_cache,
@@ -443,6 +449,7 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+            self._register_c8_scale_caches()
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
