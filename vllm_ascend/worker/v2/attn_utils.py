@@ -224,6 +224,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             mamba_specs[layer_name] = spec
             continue
 
+        # Exclude subclasses such as MLA, which use a different cache layout.
         if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
             spec = mxfp_cache_spec(spec)
 
@@ -1364,6 +1365,7 @@ def _reshape_kv_cache_v2(
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
 
+            # Exclude subclasses such as MLA, which use a different cache layout.
             if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
