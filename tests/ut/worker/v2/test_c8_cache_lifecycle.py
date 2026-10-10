@@ -3,6 +3,7 @@
 
 import ast
 import importlib.util
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,6 +76,56 @@ def test_reassigned_page_zero_restore_then_copy(has_meta):
     view[2:4].fill_(133)
     assert events == ["zero", "restore", "copy"]
     assert (view[2:4] == 133).all()
+
+
+@pytest.mark.parametrize("cache_state", ["uninitialized", "non_c8", "c8", "distinct_entries"])
+def test_shutdown_releases_c8_views_before_parent_cleanup(cache_state):
+    tree = ast.parse((ROOT / "vllm_ascend/worker/v2/model_runner.py").read_text())
+    runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+    method = next(node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
+    method.body = [node for node in method.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+    references = []
+    events = []
+
+    class Parent:
+        def shutdown(self):
+            # Model the parent's remaining cache owners, then its collection
+            # and allocator cleanup. The runner and wrapper stay alive.
+            self.kv_caches.clear()
+            assert all(reference() is None for reference in references)
+            events.append("parent_cleanup")
+
+    child = ast.ClassDef(
+        name="Runner", bases=[ast.Name(id="Parent", ctx=ast.Load())], keywords=[], body=[method], decorator_list=[]
+    )
+    namespace = {"Parent": Parent, "C8KVBlockZeroer": MODULE.C8KVBlockZeroer}
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[child], type_ignores=[])), "model_runner.py", "exec"),
+        namespace,
+    )
+    state = namespace["Runner"]()
+    state.kv_caches = {}
+    delegate = object()
+    if cache_state != "uninitialized":
+        state.kv_block_zeroer = delegate
+    if cache_state in ("c8", "distinct_entries"):
+        raw, view, scale, entries = packet()
+        storage = raw.untyped_storage()
+        references.extend((weakref.ref(view), weakref.ref(scale), weakref.ref(storage)))
+        state.kv_caches["fa"] = (raw, view)
+        state._c8_mxfp_v_scale_caches = entries
+        wrapper_entries = list(entries) if cache_state == "distinct_entries" else entries
+        wrapper = MODULE.C8KVBlockZeroer(delegate, wrapper_entries, FILL)
+        state.kv_block_zeroer = wrapper
+        del raw, view, scale, storage
+    state.shutdown()
+    assert events == ["parent_cleanup"]
+    if cache_state != "uninitialized":
+        assert state.kv_block_zeroer is delegate
+    if cache_state in ("c8", "distinct_entries"):
+        assert entries == [] and wrapper.entries == []
+    state.shutdown()
+    assert events == ["parent_cleanup", "parent_cleanup"]
 
 
 def test_missing_zeroer_still_restores_and_empty_ids_noop():

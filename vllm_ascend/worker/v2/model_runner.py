@@ -369,6 +369,20 @@ class NPUModelRunner(GPUModelRunner):
         entries = getattr(self, "_c8_mxfp_v_scale_caches", ())
         self.kv_block_zeroer = C8KVBlockZeroer(zeroer, entries, fill_mxfp_v_scale_cache) if entries else zeroer
 
+    def shutdown(self) -> None:
+        from vllm_ascend.worker.c8_cache import C8KVBlockZeroer
+
+        # Drop packet views before the parent collects tensors and empties
+        # the allocator cache. Clear in place for any retained wrapper aliases.
+        entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
+        if entries is not None:
+            entries.clear()
+        zeroer = getattr(self, "kv_block_zeroer", None)
+        if isinstance(zeroer, C8KVBlockZeroer):
+            zeroer.entries.clear()
+            self.kv_block_zeroer = zeroer.delegate
+        super().shutdown()
+
     def _register_c8_scale_caches(self, kv_caches: dict[str, Any]) -> None:
         # Run after the final cache views have been bound, before any warmup.
         from vllm_ascend.attention.attention_c8_mxfp import (
