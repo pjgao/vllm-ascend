@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import weakref
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any
 from unittest.mock import patch
 
-import numpy as np
 import torch
 import torch_npu
 import vllm.envs as envs
@@ -19,18 +20,47 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
-from ..utils import weak_ref_tensors
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+from ..utils import super_kernel_scope, use_updatable_graph, weak_ref_tensors
+from .updatable_graph import (
+    ContextSource,
+    SharedSource,
+    UpdatableGraph,
+)
+
+_acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
+_STREAM_RESOURCE_ERROR_CODE = "207008"
+_STREAM_RESOURCE_ERROR_MARKERS = (
+    "insufficient_stream_resources",
+    "stream resources are insufficient",
+)
+_OLD_HDK_CAPTURE_ERROR_MARKERS = ("alloc sq cq fail",)
+
+
+def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    lowered_message = message.lower()
+    has_error_code = _STREAM_RESOURCE_ERROR_CODE in message
+    has_stream_resource_marker = any(marker in lowered_message for marker in _STREAM_RESOURCE_ERROR_MARKERS)
+    return has_stream_resource_marker or (has_error_code and "stream resource" in lowered_message)
+
+
+def _is_old_hdk_capture_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _OLD_HDK_CAPTURE_ERROR_MARKERS)
 
 
 @dataclasses.dataclass
 class ACLGraphEntry:
     batch_descriptor: BatchDescriptor
-    aclgraph: Optional[torch.npu.NPUGraph] = None
-    output: Optional[Any] = None
+    aclgraph: torch.npu.NPUGraph | None = None
+    output: Any | None = None
 
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
-    input_addresses: Optional[list[int]] = None
+    input_addresses: list[int] | None = None
 
 
 class ACLGraphWrapper:
@@ -58,22 +88,32 @@ class ACLGraphWrapper:
     guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
     """
 
-    def __init__(self,
-                 runnable: Callable,
-                 vllm_config: VllmConfig,
-                 runtime_mode: CUDAGraphMode,
-                 cudagraph_options: Optional[CUDAGraphOptions] = None):
+    def __init__(
+        self,
+        runnable: Callable,
+        vllm_config: VllmConfig,
+        runtime_mode: CUDAGraphMode,
+        cudagraph_options: CUDAGraphOptions | None = None,
+        *,
+        use_eagle: bool = False,
+        enable_enpu: bool = False,
+        update_stream: torch.npu.Stream | None = None,
+    ):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
+
+        # A NONE runtime mode does not use ACL Graph, so avoid initializing
+        # graph-specific state (including the Ascend config lookup).
+        assert self.runtime_mode != CUDAGraphMode.NONE
+
         self.compilation_config = vllm_config.compilation_config
+        self.enable_super_kernel = get_ascend_config().ascend_compilation_config.enable_super_kernel
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
+        self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
-        # assert runtime_mode is not NONE(no aclgraph), otherwise, we don't
-        # need to initialize a ACLGraphWrapper.
-        assert self.runtime_mode != CUDAGraphMode.NONE
         self.graph_pool = current_platform.get_global_graph_pool()
 
         if cudagraph_options is None:
@@ -81,15 +121,33 @@ class ACLGraphWrapper:
         self.aclgraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry]\
-                                                                        = {}
+        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self.enable_enpu = enable_enpu
+        self.use_eagle = use_eagle
+        self.update_stream = update_stream
+        self.attn_backend = None
+        self.draft_model_metadata: list[dict[str, Any]] = []
+        _acl_graph_wrappers.add(self)
+
+    def set_update_stream(self, update_stream):
+        self.update_stream = update_stream
+
+    def set_attn_backend(self, attn_backend):
+        self.attn_backend = attn_backend
+
+    def update_draft_model_metadata(self, draft_model_metadata: list[dict[str, Any]]):
+        # This has been prepared for the update full graph of MRV1.
+        self.draft_model_metadata = draft_model_metadata
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
         if hasattr(self.runnable, key):
             return getattr(self.runnable, key)
-        raise AttributeError(f"Attribute {key} not exists in the runnable of "
-                             f"aclgraph wrapper: {self.runnable}")
+        if self.is_debugging_mode:
+            raise AttributeError(
+                f"Attribute {key} not exists in the runnable of aclgraph wrapper: {self._runnable_str}"
+            )
+        raise AttributeError(f"Attribute {key} not found. Set VLLM_LOGGING_LEVEL=DEBUG for more details.")
 
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
@@ -100,8 +158,7 @@ class ACLGraphWrapper:
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
-        if aclgraph_runtime_mode == CUDAGraphMode.NONE or \
-                            aclgraph_runtime_mode != self.runtime_mode:
+        if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without aclgraphs.
             # We do not trigger capture/replay if the runtime mode is not
@@ -112,8 +169,7 @@ class ACLGraphWrapper:
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = \
-                ACLGraphEntry(batch_descriptor=batch_descriptor)
+            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
@@ -123,16 +179,13 @@ class ACLGraphWrapper:
                 # capturing is fast, we don't need to log it for every
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
-                logger.debug("Capturing a aclgraph on (%s,%s)",
-                             self.runtime_mode.name, entry.batch_descriptor)
+                logger.debug("Capturing ACL graph (%s, %s)", self.runtime_mode.name, entry.batch_descriptor)
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
+            input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
-            aclgraph = torch.npu.NPUGraph()
+            aclgraph = UpdatableGraph()
 
             with ExitStack() as stack:
                 if self.aclgraph_options.gc_disable:
@@ -143,22 +196,69 @@ class ACLGraphWrapper:
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(
-                        patch("torch.npu.empty_cache", lambda: None))
+                    stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
+
+                # Sync offloader's copy stream before capture.
+                # Ensure any pre-capture prefetches from offloader are complete.
+                from vllm.model_executor.offloader.base import get_offloader
+
+                get_offloader().sync_prev_onload()
                 forward_context.capturing = True
-                with torch.npu.graph(aclgraph, pool=self.graph_pool):
-                    # `output` is managed by pytorch's aclgraph pool
-                    output = self.runnable(*args, **kwargs)
-                    if self.aclgraph_options.weak_ref_output:
-                        # by converting it to weak ref,
-                        # the original `output` will immediately be released
-                        # to save memory. It is only safe to do this for
-                        # the last graph in piecewise aclgraph mode, because
-                        # the output of the last graph will not be used by
-                        # any other acl graph.
-                        output = weak_ref_tensors(output)
+                try:
+                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                        # `output` is managed by pytorch's aclgraph pool
+                        with super_kernel_scope("full_model", self.enable_super_kernel):
+                            output = self.runnable(*args, **kwargs)
+                        # Join offloader's copy stream after forward to avoid
+                        # unjoined stream error. The last layer's start_prefetch
+                        # forks copy_stream, but wait_prefetch only happens in
+                        # the next forward pass.
+                        get_offloader().join_after_forward()
+                        if self.aclgraph_options.weak_ref_output:
+                            # by converting it to weak ref,
+                            # the original `output` will immediately be released
+                            # to save memory. It is only safe to do this for
+                            # the last graph in piecewise aclgraph mode, because
+                            # the output of the last graph will not be used by
+                            # any other acl graph.
+                            output = weak_ref_tensors(output)
+                except RuntimeError as exc:
+                    if _is_old_hdk_capture_error(exc):
+                        raise RuntimeError(
+                            "ACL graph capture failed with an old Ascend HDK/CANN stack "
+                            "signature (`Alloc sq cq fail`). Please upgrade Ascend HDK to "
+                            "25.5.1 or later and use the matching CANN stack.\n"
+                            f"Original error:\n{exc}"
+                        ) from exc
+                    elif _is_stream_resource_capture_error(exc):
+                        raise RuntimeError(
+                            "ACL graph capture failed with a known stream-resource exhaustion "
+                            "signature. Consider reducing cudagraph_capture_sizes, lowering "
+                            "max_cudagraph_capture_size, preferring FULL or FULL_DECODE_ONLY for "
+                            "mostly uniform decode workloads, or temporarily disabling graph mode "
+                            "to confirm the failure is capture-related.\n"
+                            f"Original error:\n{exc}"
+                        ) from exc
+                    raise
+
+            if self.enable_super_kernel:
+                aclgraph.super_kernel_optimize(
+                    optimize_options={
+                        "dcci_after_kernel_end": [".*"],
+                    },
+                )
+                logger.info_once("Super kernel optimization is enabled for ACL graph capture.")
+
+            # here we always use weak ref for the workspaces
+            # to save memory
+            global _graph_params
+            global _draft_graph_params
+            global _draft_graph_prefill_params
+            weak_ref_workspaces(_graph_params)
+            weak_ref_workspaces(_draft_graph_params)
+            weak_ref_workspaces(_draft_graph_prefill_params)
 
             # here we always use weak ref for the output
             # to save memory
@@ -174,246 +274,87 @@ class ACLGraphWrapper:
 
         if self.is_debugging_mode:
             # check if the input addresses are the same
-            new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
+            new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for aclgraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
-                f"got {new_input_addresses}")
+                f"got {new_input_addresses}"
+            )
 
-        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
         # To ensure proper ordering, we must call synchronize here before replaying,
         # so that update_attn_params only executes after the previous graph replay has fully completed.
-        torch.npu.synchronize()
-        entry.aclgraph.replay()
+        # If we do not in main model and in full-graph mode when using merge-eagle-graph,
+        # we do not need to synchronize.
+        # When enable_enpu is on, model_runner orders update vs replay; skip here.
+        # When FULL + EAGLE draft (merge path), replay does not need this barrier.
+        is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
+        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        if not self.enable_enpu and need_sync:
+            torch.npu.current_stream().synchronize()
+        if self.runtime_mode == CUDAGraphMode.FULL and use_updatable_graph(self.attn_backend):
+            self._updatable_graph_replay(forward_context, entry.aclgraph)
+        else:
+            entry.aclgraph.replay()
+        logger.info_once("ACL graph replay is active (logged once).")
         return entry.output
 
-
-def update_attn_params(update_stream, forward_context, runtime_shape):
-    graph_params = get_graph_params()
-    # For Qwen3-next, since the kv_cache_config has already categorized
-    # linear_attn and self_attn, the attn_metadata is first arranged with
-    # self_attn followed by linear_attn. Therefore, using zip directly
-    # filters out the update operations for linear_attn.
-    with torch.npu.stream(update_stream):
-        for key, param, handle, event in zip(
-                forward_context.attn_metadata,
-                graph_params.attn_params[runtime_shape],
-                graph_params.handles[runtime_shape],
-                graph_params.events[runtime_shape],
-        ):
-            (query, key_cache, value, block_tables, attn_mask, block_size,
-             seq_lens, query_start_loc, num_kv_heads, num_heads, scale,
-             attn_output, softmax_lse) = param
-
-            seq_lens = forward_context.attn_metadata[key].seq_lens_list
-            query_start_loc = forward_context.attn_metadata[
-                key].query_start_loc_list
-            torch.npu.graph_task_update_begin(update_stream, handle)
-            torch_npu.npu_fused_infer_attention_score.out(
-                query=query,
-                key=key_cache,
-                value=value,
-                block_table=block_tables,
-                atten_mask=attn_mask,
-                input_layout="TND",
-                block_size=block_size,
-                actual_seq_lengths=query_start_loc,
-                actual_seq_lengths_kv=seq_lens,
-                num_key_value_heads=num_kv_heads,
-                num_heads=num_heads,
-                scale=scale,
-                sparse_mode=3,
-                workspace=graph_params.workspaces.get(runtime_shape),
-                out=[attn_output, softmax_lse],
-            )
-            torch.npu.graph_task_update_end(update_stream)
-
-            event.record(update_stream)
+    def _updatable_graph_replay(
+        self,
+        forward_context,
+        graph: UpdatableGraph,
+    ):
+        assert self.update_stream is not None
+        if _EXTRA_CTX.is_draft_model:
+            resolved_tasks = graph.resolve_tasks(SharedSource(self.draft_model_metadata))
+        else:
+            resolved_tasks = graph.resolve_tasks(ContextSource(forward_context.attn_metadata))
+        if self.enable_enpu:
+            graph.update(self.update_stream, resolved_tasks)
+            graph.replay()
+        else:
+            graph.replay()
+            graph.update(self.update_stream, resolved_tasks)
 
 
-def update_mla_attn_params(update_stream, forward_context, runtime_shape,
-                           speculative_config):
-    if forward_context.is_mtp_model:
-        graph_params = get_mtp_graph_params()
-    else:
-        graph_params = get_graph_params()
-    # FIXME: Behold! We are using a temporary hack here to update the args
-    # for each layer's attention op in the graph.
-    with torch.npu.stream(update_stream):
-        for key, param, handle, event in zip(
-                forward_context.attn_metadata,
-                graph_params.attn_params[runtime_shape],
-                graph_params.handles[runtime_shape],
-                graph_params.events[runtime_shape],
-        ):
-            (q_nope, k_nope, q_pe, k_pe, num_heads, num_kv_heads, input_layout,
-             spec_attn_mask, sparse_mode, scale, block_table, block_size,
-             seq_lens_list, actual_seq_lengths, attn_output,
-             softmax_lse) = param
-            seq_lens_list = forward_context.attn_metadata[
-                key].decode.seq_lens_list
-            if speculative_config and speculative_config.method == "deepseek_mtp" \
-                    and not forward_context.is_mtp_model:
-                actual_seq_lengths = forward_context.attn_metadata[
-                    key].decode.actual_seq_lengths_q
-                spec_multiple = speculative_config.num_speculative_tokens + 1
-                seq_lens_list = seq_lens_list + [0] * (
-                    runtime_shape // spec_multiple - len(seq_lens_list))
-                actual_seq_lengths = [
-                    spec_multiple * (i + 1)
-                    for i in range(runtime_shape // spec_multiple)
-                ]
-            elif forward_context.is_mtp_model:
-                actual_seq_lengths = forward_context.attn_metadata[
-                    key].decode.actual_seq_lengths_q
-                block_table = forward_context.attn_metadata[
-                    key].decode.block_table
-                seq_lens_list = seq_lens_list + [0] * (
-                    len(actual_seq_lengths) - len(seq_lens_list))
-            else:
-                seq_lens_list = seq_lens_list + [0] * (runtime_shape -
-                                                       len(seq_lens_list))
-            torch.npu.graph_task_update_begin(update_stream, handle)
-
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                k_nope,
-                k_nope,
-                query_rope=q_pe,
-                key_rope=k_pe,
-                num_heads=num_heads,
-                num_key_value_heads=num_kv_heads,
-                input_layout=input_layout,
-                atten_mask=spec_attn_mask,
-                sparse_mode=sparse_mode,
-                scale=scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=block_table,
-                block_size=block_size,
-                actual_seq_lengths_kv=seq_lens_list,
-                actual_seq_lengths=actual_seq_lengths,
-                workspace=graph_params.workspaces.get(runtime_shape),
-                out=[attn_output, softmax_lse])
-            torch.npu.graph_task_update_end(update_stream)
-
-            event.record(update_stream)
+def weak_ref_workspaces(params):
+    if params is None:
+        return
+    for num_tokens in params.workspaces:
+        if params.workspaces[num_tokens] is None:
+            continue
+        params.workspaces[num_tokens] = weak_ref_tensors(params.workspaces[num_tokens])
 
 
-def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):
-    # FIXME: Behold! We are using a temporary hack here to update the args
-    # for each layer's attention op in the graph.
-    graph_params = get_graph_params()
-    with torch.npu.stream(update_stream):
-        for key, param, handle, event in zip(
-                forward_context.attn_metadata,
-                graph_params.attn_params[runtime_shape],
-                graph_params.handles[runtime_shape],
-                graph_params.events[runtime_shape],
-        ):
-            (q_nope, k_nope, value, num_heads, num_kv_heads, scale,
-             block_table, block_size, actual_seq_lengths_kv,
-             actual_seq_lengths_q, attn_output, softmax_lse, dcp_size,
-             pcp_rank, dcp_rank) = param
-            attn_metadata = forward_context.attn_metadata[key]
-            actual_seq_lengths_kv = attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp[:,
-                                                                                             pcp_rank,
-                                                                                             dcp_rank]
-            pad_length = runtime_shape - len(actual_seq_lengths_kv)
-            if pad_length > 0:
-                pad_tensor = np.zeros(pad_length,
-                                      dtype=actual_seq_lengths_kv.dtype)
-                actual_seq_lengths_kv = np.concatenate(
-                    [actual_seq_lengths_kv, pad_tensor])
+def update_full_graph_params(
+    attn_backend,
+    update_stream,
+    forward_context,
+    num_tokens,
+    vllm_config,
+    speculative_config=None,
+    draft_attn_metadatas=None,
+):
+    if use_updatable_graph(attn_backend):
+        return
 
-            actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q[:
-                                                                      attn_metadata
-                                                                      .
-                                                                      num_decode_tokens]
-            if (runtime_shape - len(actual_seq_lengths_q)):
-                actual_seq_lengths_q = actual_seq_lengths_q + [
-                    actual_seq_lengths_q[-1]
-                ] * (runtime_shape - len(actual_seq_lengths_q))
-            if dcp_size > 1:
-                num_heads = num_heads * dcp_size
+    # vLLM >= 0.27.1 (main) makes get_current_vllm_config() raise
+    # AssertionError outside set_current_vllm_config(); the SFA backend
+    # resolution in get_impl_cls() needs the config.
+    from vllm.config import set_current_vllm_config
 
-            torch.npu.graph_task_update_begin(update_stream, handle)
-
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                k_nope,
-                value,
-                num_heads=num_heads,
-                num_key_value_heads=num_kv_heads,
-                input_layout="TND",
-                atten_mask=None,
-                scale=scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                softmax_lse_flag=True,
-                block_table=block_table,
-                block_size=block_size,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                actual_seq_lengths=actual_seq_lengths_q,
-                workspace=graph_params.workspaces.get(runtime_shape),
-                out=[attn_output, softmax_lse])
-            torch.npu.graph_task_update_end(update_stream)
-
-            event.record(update_stream)
-
-
-def update_mla_attn_dcp_pcp_params(update_stream, forward_context,
-                                   runtime_shape):
-    graph_params = get_graph_params()
-    # FIXME: Behold! We are using a temporary hack here to update the args
-    # for each layer's attention op in the graph.
-    with torch.npu.stream(update_stream):
-        for key, param, handle, event in zip(
-                forward_context.attn_metadata,
-                graph_params.attn_params[runtime_shape],
-                graph_params.handles[runtime_shape],
-                graph_params.events[runtime_shape],
-        ):
-            (q_nope, q_pe, k_nope, k_pe, block_table, seq_len, num_heads,
-             scale, num_kv_heads, attn_output, softmax_lse) = param
-
-            decode_meta = forward_context.attn_metadata[key].decode
-            seq_len = decode_meta.cp_seq_len
-
-            # For pcp + spec decode, we flatten seq_lens
-            # to avoid irregular spec_attn_mask shape,
-            # so there's no need to divide runtime_shape by spec_multiple
-            pad_length = runtime_shape - len(seq_len)
-            pad_tensor = torch.zeros(pad_length,
-                                     dtype=seq_len.dtype,
-                                     device=seq_len.device)
-            seq_len = torch.cat([seq_len, pad_tensor], dim=0)
-
-            torch.npu.graph_task_update_begin(update_stream, handle)
-
-            torch_npu.atb.npu_multi_head_latent_attention(
-                q_nope,
-                q_pe,
-                k_nope,
-                k_pe,
-                block_table,
-                seq_len,
-                num_heads,
-                scale,
-                num_kv_heads,
-                return_lse=True,
-                calc_type="calc_type_ring",
-                workspace=graph_params.workspaces.get(runtime_shape),
-                output=attn_output,
-                lse=softmax_lse)
-            torch.npu.graph_task_update_end(update_stream)
-
-            event.record(update_stream)
+    with set_current_vllm_config(vllm_config):
+        impl_cls = attn_backend.get_impl_cls()
+        impl_cls.update_graph_params(
+            update_stream,
+            forward_context,
+            num_tokens,
+            vllm_config,
+            speculative_config,
+            draft_attn_metadatas=draft_attn_metadatas,
+        )
 
 
 @dataclass
@@ -424,59 +365,76 @@ class GraphParams:
     attn_params: dict[int, list[tuple]]
 
 
-_graph_params: Optional[GraphParams] = None
+_graph_params: GraphParams | None = None
 
 
-def set_graph_params(aclgraph_capture_sizes: set[int]):
+def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
     if _graph_params is not None:
         raise ValueError("Graph parameters have already been set!")
     _graph_params = GraphParams(
-        {size: []
-         for size in aclgraph_capture_sizes},
-        {size: None
-         for size in aclgraph_capture_sizes},
-        {size: []
-         for size in aclgraph_capture_sizes},
-        {size: []
-         for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: None for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
     )
 
 
-def update_graph_params_workspaces(num_tokens: int, workspace: int):
+def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
     global _graph_params
     if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = weak_ref_tensors(workspace)
+        _graph_params.workspaces[num_tokens] = workspace
 
 
 def get_graph_params():
     return _graph_params
 
 
-_mtp_graph_params: Optional[GraphParams] = None
+_draft_graph_params: GraphParams | None = None
 
 
-def set_mtp_graph_params(aclgraph_capture_sizes: set[int]):
-    global _mtp_graph_params
-    if _mtp_graph_params is not None:
-        raise ValueError("MTPGraph parameters have already been set!")
-    _mtp_graph_params = GraphParams(
-        {size: []
-         for size in aclgraph_capture_sizes},
-        {size: None
-         for size in aclgraph_capture_sizes},
-        {size: []
-         for size in aclgraph_capture_sizes},
-        {size: []
-         for size in aclgraph_capture_sizes},
+def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
+    global _draft_graph_params
+    if _draft_graph_params is not None:
+        raise ValueError("DraftGraph parameters have already been set!")
+    _draft_graph_params = GraphParams(
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: None for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
     )
 
 
-def update_mtp_graph_params_workspaces(num_tokens: int, workspace: Any):
-    global _mtp_graph_params
-    if _mtp_graph_params is not None:
-        _mtp_graph_params.workspaces[num_tokens] = workspace
+def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any):
+    global _draft_graph_params
+    if _draft_graph_params is not None:
+        _draft_graph_params.workspaces[num_tokens] = workspace
 
 
-def get_mtp_graph_params():
-    return _mtp_graph_params
+def get_draft_graph_params():
+    return _draft_graph_params
+
+
+_draft_graph_prefill_params: GraphParams | None = None
+
+
+def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
+    global _draft_graph_prefill_params
+    if _draft_graph_prefill_params is not None:
+        raise ValueError("DraftGraph preill parameters have already been set!")
+    _draft_graph_prefill_params = GraphParams(
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: None for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+    )
+
+
+def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any):
+    global _draft_graph_prefill_params
+    if _draft_graph_prefill_params is not None:
+        _draft_graph_prefill_params.workspaces[num_tokens] = workspace
+
+
+def get_draft_graph_prefill_params():
+    return _draft_graph_prefill_params

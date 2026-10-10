@@ -16,6 +16,7 @@
 #
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this adaptor.
 import json
+from inspect import getattr_static
 from typing import Any
 
 import torch
@@ -23,196 +24,171 @@ import torch.distributed as dist
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.eplb.adaptor.abstract_adaptor import EplbAdaptor
+from vllm_ascend.quantization.quant_type import QuantType
+
+EPLB_EXPERT_WEIGHT_NAMES = {
+    (QuantType.NONE, False): ("w13_weight", "w2_weight"),
+    (QuantType.NONE, True): ("w13_weight_list", "w2_weight_list"),
+    (QuantType.W8A8, False): (
+        "w13_weight_list",
+        "w2_weight_list",
+        "w13_weight_scale_fp32_list",
+        "w2_weight_scale_list",
+    ),
+    (QuantType.W8A8, True): (
+        "w13_weight_list",
+        "w2_weight_list",
+        "w13_weight_scale_fp32_list",
+        "w2_weight_scale_list",
+        "fused_w1_scale_list",
+        "fused_w2_scale_list",
+    ),
+    (QuantType.W4A8, True): (
+        "w13_weight_list",
+        "w2_weight_list",
+        "w13_weight_scale_list",
+        "w2_weight_scale_list",
+        "w13_scale_bias_list",
+        "w2_scale_bias_list",
+    ),
+    (QuantType.W4A8, False): (
+        "w13_weight_list",
+        "w2_weight_list",
+        "w13_weight_scale_list",
+        "w2_weight_scale_list",
+        "w13_scale_bias_list",
+        "w2_scale_bias_list",
+    ),
+    (QuantType.W4A4MXFP, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W4A4MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W8A8MXFP, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W8A8MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+}
 
 
-class VllmEplbAdaptor(EplbAdaptor):
+class VllmEplbAdaptor:
+    _registered_moe_layers: list["torch.nn.Module"] = []
+
+    @staticmethod
+    def register_layer(layer: "torch.nn.Module") -> None:
+        """Register a MoE layer for EPLB. Called during layer initialization.
+
+        Only real layers call this; PPMissingLayer won't, so the registry
+        naturally contains only layers on this PP rank.
+        """
+        VllmEplbAdaptor._registered_moe_layers.append(layer)
 
     def __init__(self, model, **args):
         super().__init__(**args)
-        self.model = model
+        if hasattr(model, "language_model"):
+            self.model = model.language_model
+            self.config = model.config.text_config
+        else:
+            self.model = model
+            self.config = model.config
         self.rank_id = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.param_dict = dict(self.model.named_parameters())
-        if self.model.config.model_type == "qwen3_moe":
-            self.num_dense_layers = 0
-            self.global_expert_num = self.model.config.num_experts
-        else:
-            self.num_dense_layers = self.model.config.first_k_dense_replace
-            self.global_expert_num = self.model.config.n_routed_experts
-        self.num_moe_layers = self.model.config.num_hidden_layers - self.num_dense_layers
-        self.init_redundancy_expert = get_ascend_config(
-        ).init_redundancy_expert
+        self.num_dense_layers = getattr(self.config, "first_k_dense_replace", 0)
 
-        for i in range(self.num_dense_layers,
-                       self.model.config.num_hidden_layers):
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w13_weight_list"] = \
-                self.model.model.layers[i].mlp.experts.w13_weight_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w2_weight_list"] = \
-                self.model.model.layers[i].mlp.experts.w2_weight_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w13_weight_scale_fp32_list"] = \
-                self.model.model.layers[i].mlp.experts.w13_weight_scale_fp32_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w2_weight_scale_list"] = \
-                self.model.model.layers[i].mlp.experts.w2_weight_scale_list
-        # TODO: init self.expert_weight_names depending on different model types, only deepseek v3 w8a8 and qwen3-moe is supported here
-        if self.model.quant_config is not None:
-            self.expert_weight_names = [
-                "w13_weight_list", "w2_weight_list",
-                "w13_weight_scale_fp32_list", "w13_weight_offset",
-                "w2_weight_scale_list", "w2_weight_offset"
-            ]
-        else:
-            self.expert_weight_names = ["w13_weight", "w2_weight"]
+        self.moe_layers = VllmEplbAdaptor._registered_moe_layers
+        self.num_moe_layers = len(self.moe_layers)
 
-        self.expert_map_per_layer = dict(
-        )  # reference to expert map on device for expert map update
-        self.expert_map_per_layer_cpu = dict(
-        )  # copy of expert map on CPU to avoid device synchronize frequently
-        for layer_idx in range(self.num_moe_layers):
-            self.expert_map_per_layer[self.num_dense_layers + layer_idx] = \
-                self.model.get_expert_map(self.num_dense_layers + layer_idx)
+        self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
 
-        # TODO: here we set number of buffer tensor equal to number of expert in each laryer, which can be improved
-        num_buffer_tensor = torch.where(
-            self.expert_map_per_layer[self.num_dense_layers] != -1)[0].numel()
-        self.buffer_tensor_list: list[list[Any]] = [
-            [] for _ in range(num_buffer_tensor)
-        ]
-        self.init_buffer_tensor(num_buffer_tensor)
+        # Get num_local_experts from first real MoE layer
+        first_layer = self.moe_layers[0]
+        self.num_local_experts = first_layer.local_num_experts
+        self.ep_rank = first_layer.ep_rank
 
         self.expert_param_per_layer = dict()
+        self.expert_weight_key_per_layer = dict()
         self.init_expert_param_per_layer()
 
-        self.log2phy_map_per_layer = dict()
-        for layer_idx in range(self.num_moe_layers):
-            self.log2phy_map_per_layer[self.num_dense_layers + layer_idx] = \
-                self.model.get_log2phy_map(self.num_dense_layers + layer_idx)
+        num_buffer_tensor = self.num_local_experts
+        self.buffer_tensor_list: dict[Any, list[list[Any]]] = dict()
+        self.init_buffer_tensor(num_buffer_tensor)
 
-        self.all_topk_ids = []
+        self.log2phy_map_per_layer = dict()
+        for local_idx, layer in enumerate(self.moe_layers):
+            self.log2phy_map_per_layer[local_idx] = layer.get_log2phy_map()
 
     def init_buffer_tensor(self, num_buffer_tensor):
-        for buffer_id in range(num_buffer_tensor):
-            for name in self.expert_weight_names:
-                complete_name = "model.layers." + str(
-                    self.num_dense_layers) + ".mlp.experts." + name
-                if name in [
-                        "w13_weight_list", "w2_weight_list",
-                        "w13_weight_scale_fp32_list", "w2_weight_scale_list"
-                ]:
-                    expert_tensor = self.param_dict[complete_name][0]
-                    expert_tensor = expert_tensor.clone()
-                else:
-                    expert_tensor = self.param_dict[complete_name][0].data[0]
-                buffer_tensor = torch.empty_like(expert_tensor)
-                self.buffer_tensor_list[buffer_id].append(buffer_tensor)
+        buffer_tensor_shapes: dict[Any, list[torch.Size]] = dict()
+        for local_idx, _ in enumerate(self.moe_layers):
+            expert_weight_key = self.expert_weight_key_per_layer[local_idx]
+            expert_weight_names = EPLB_EXPERT_WEIGHT_NAMES[expert_weight_key]
+            expert_tensors = [self.param_dict[f"{local_idx}.{name}"][0] for name in expert_weight_names]
+            expert_tensor_shapes = [tensor.shape for tensor in expert_tensors]
+            if expert_weight_key in self.buffer_tensor_list:
+                assert expert_tensor_shapes == buffer_tensor_shapes[expert_weight_key], (
+                    f"EPLB expert weight shapes mismatch for {expert_weight_key}: "
+                    f"expected {buffer_tensor_shapes[expert_weight_key]}, got {expert_tensor_shapes}"
+                )
+                continue
+            buffer_tensor_shapes[expert_weight_key] = expert_tensor_shapes
+            self.buffer_tensor_list[expert_weight_key] = [[] for _ in range(num_buffer_tensor)]
+            for buffer_id in range(num_buffer_tensor):
+                for expert_tensor in expert_tensors:
+                    buffer_tensor = torch.empty_like(expert_tensor)
+                    self.buffer_tensor_list[expert_weight_key][buffer_id].append(buffer_tensor)
 
     def init_expert_param_per_layer(self):
-        key = f"model.layers.{self.num_dense_layers}.mlp.experts.{self.expert_weight_names[0]}"
-        num_local_expert = len(self.param_dict[key])
-        for moe_layer_id in range(self.num_moe_layers):
-            layer_idx = self.num_dense_layers + moe_layer_id
-            self.expert_param_per_layer[layer_idx] = list()
-            for local_expert_id in range(num_local_expert):
+        self.param_dict = dict()
+
+        for local_idx, layer in enumerate(self.moe_layers):
+            quant_type = QuantType.NONE if self.model.quant_config is None else layer.quant_type
+            expert_weight_key = (quant_type, get_ascend_config().enable_fused_mc2 == 1)
+            if expert_weight_key[0] == QuantType.W4A8MXFP:
+                raise RuntimeError(f"EPLB not support {quant_type}")
+            if expert_weight_key not in EPLB_EXPERT_WEIGHT_NAMES:
+                raise ValueError(f"EPLB not support {quant_type} with fused MC2 {expert_weight_key[1]}")
+            expert_weight_names = EPLB_EXPERT_WEIGHT_NAMES[expert_weight_key]
+            self.expert_weight_key_per_layer[local_idx] = expert_weight_key
+            self.expert_param_per_layer[local_idx] = list()
+            for name in expert_weight_names:
+                param_key = f"{local_idx}.{name}"
+                # Inspect the attribute without invoking __getattr__. Besides
+                # avoiding side effects from dynamic proxies, this prevents an
+                # unspecced MagicMock from fabricating the optional accessor.
+                # The refactored MoERunner declares the accessor because its
+                # RoutedExperts child owns weights; legacy layers expose them
+                # directly.
+                get_parameter = (
+                    layer.get_eplb_parameter if getattr_static(layer, "get_eplb_parameter", None) is not None else None
+                )
+                self.param_dict[param_key] = get_parameter(name) if get_parameter is not None else getattr(layer, name)
+            for local_expert_id in range(self.num_local_experts):
                 per_expert_param = list()
-                for name in self.expert_weight_names:
-                    if name in [
-                            "w13_weight_list", "w2_weight_list",
-                            "w13_weight_scale_fp32_list",
-                            "w2_weight_scale_list"
-                    ]:
-                        per_expert_param.append(
-                            self.param_dict["model.layers." + str(layer_idx) +
-                                            ".mlp.experts." +
-                                            name][local_expert_id])
-                    else:
-                        per_expert_param.append(
-                            self.param_dict["model.layers." + str(layer_idx) +
-                                            ".mlp.experts." +
-                                            name][0].data[local_expert_id])
-                self.expert_param_per_layer[layer_idx].append(per_expert_param)
+                for name in expert_weight_names:
+                    per_expert_param.append(self.param_dict[f"{local_idx}.{name}"][local_expert_id])
+                self.expert_param_per_layer[local_idx].append(per_expert_param)
 
     def get_rank_expert_workload(self) -> torch.Tensor:
-        self.moe_load = self.model.get_all_moe_loads()
+        loads = [layer.moe_load for layer in self.moe_layers]
+        self.moe_load = torch.stack(loads, dim=0) if loads else torch.empty(0)
         return self.moe_load
 
-    def get_init_expert_map(self, num_moe_layers):
-        expert_map = self.model.get_all_expert_map(num_moe_layers)
-        if dist.is_initialized():
-            world_size = dist.get_world_size()
-
-        gathered = torch.empty(
-            (world_size, *expert_map.shape),  # [W, L, E]
-            dtype=expert_map.dtype,
-            device=expert_map.device)
-
-        dist.all_gather_into_tensor(gathered, expert_map)
-        all_maps = gathered.permute(1, 0, 2)
-        all_expert_maps = all_maps.cpu()
-
-        for layer_idx in range(num_moe_layers):
-            self.expert_map_per_layer_cpu[self.num_dense_layers + layer_idx] = \
-                all_expert_maps[layer_idx][self.rank_id]
-
-        return all_expert_maps
-
-    def get_init_expert_map_from_file(self, num_moe_layers, expert_map_path):
-
-        try:
-            expert_map_tensor, layers_num, ranks_num = self._expert_file_to_tensor(
-                expert_map_path)
-            expert_map_all = self.local2global(expert_map_tensor)
-        except (TypeError, FileNotFoundError, OSError):
-            expert_map_all = self.determine_expert_map_all()
-
-        for layer_idx in range(num_moe_layers):
-            if self.model.config.model_type == "qwen3_moe":
-                self.expert_map_per_layer_cpu[layer_idx] = \
-                    expert_map_all[layer_idx][self.rank_id]
-            else:
-                self.expert_map_per_layer_cpu[layer_idx + self.num_dense_layers] = \
-                    expert_map_all[layer_idx][self.rank_id]
-        return expert_map_all
-
-    def _expert_file_to_tensor(self, expert_map_path: str):
-        with open(expert_map_path, "r") as f:
-            data = json.load(f)
-            layers_num = data["moe_layer_count"]
-            gpus_num = data["layer_list"][0]["device_count"]
-
-            tensor_data = []
-            for layer in data["layer_list"]:
-                device_data = []
-                for device in layer["device_list"]:
-                    device_data.append(device["device_expert"])
-                tensor_data.append(device_data)
-            expert_map_tensor = torch.tensor(tensor_data, dtype=torch.int32)
-            return expert_map_tensor, layers_num, gpus_num
-        logger.error(f"failed to read expert_map_path: {expert_map_path}")
+    def clear_all_moe_loads(self):
+        for layer in self.moe_layers:
+            layer.clear_moe_load()
 
     def _export_tensor_to_file(self, expert_maps, expert_map_record_path: str):
         if self.rank_id == 0:
             num_local_experts = expert_maps.max() + 1
-            expert_maps_local = self.global2local(expert_maps,
-                                                  num_local_experts)
 
-            expert_maps_list = expert_maps_local.tolist()
-            record: dict[str, Any] = {
-                "moe_layer_count": len(expert_maps_list),
-                "layer_list": []
-            }
+            expert_maps_list = expert_maps.tolist()
+            record: dict[str, Any] = {"moe_layer_count": len(expert_maps_list), "layer_list": []}
 
             for layer_idx, layer_data in enumerate(expert_maps_list):
                 layer_record: dict[str, Any] = {
                     "layer_id": layer_idx,
                     "device_count": len(layer_data),
-                    "device_list": []
+                    "device_list": [],
                 }
 
                 for device_idx, experts in enumerate(layer_data):
-                    device_record = {
-                        "device_id": device_idx,
-                        "device_expert": experts
-                    }
+                    placement = [experts.index(i) for i in range(num_local_experts)]
+                    device_record = {"device_id": device_idx, "device_expert": placement}
                     layer_record["device_list"].append(device_record)
 
                 record["layer_list"].append(layer_record)
@@ -221,96 +197,26 @@ class VllmEplbAdaptor(EplbAdaptor):
                 json.dump(record, f, indent=4)
 
     def do_update_expert_map(self, layer_id, updated_expert_map):
-        self.expert_map_per_layer[layer_id].copy_(updated_expert_map)
         self.expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map)
 
-    def do_update_expert_weight(self, layer_id, local_expert_to_replace,
-                                buffer_tensor_id):
+    def do_update_expert_weight(self, layer_id, local_expert_to_replace, buffer_tensor_id):
+        expert_weight_key = self.expert_weight_key_per_layer[layer_id]
         for expert_tensor, buffer_tensor in zip(
-                self.expert_param_per_layer[layer_id][local_expert_to_replace],
-                self.buffer_tensor_list[buffer_tensor_id]):
+            self.expert_param_per_layer[layer_id][local_expert_to_replace],
+            self.buffer_tensor_list[expert_weight_key][buffer_tensor_id],
+        ):
             expert_tensor.copy_(buffer_tensor)
-            logger.debug(f"Expert tensor shape is :{expert_tensor.shape}")
+            logger.debug("Expert tensor shape is :%s", expert_tensor.shape)
 
     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):
         if self.log2phy_map_per_layer[layer_id] is not None:
             self.log2phy_map_per_layer[layer_id].copy_(updated_log2phy_map)
 
-    def global2local(self, placement: torch.Tensor,
-                     E_local: int) -> torch.Tensor:
+    def get_global_expert_map(self):
+        all_layer_global_expert_map = []
+        for local_idx, layer in enumerate(self.moe_layers):
+            map_cpu = layer.global_expert_map.cpu()
+            all_layer_global_expert_map.append(map_cpu)
+            self.expert_map_per_layer_cpu[local_idx] = map_cpu[self.ep_rank]
 
-        L, G, _ = placement.shape
-        device = placement.device
-
-        pt_local = torch.full((L, G, E_local),
-                              fill_value=-1,
-                              dtype=torch.long,
-                              device=device)
-
-        valid = placement >= 0
-        l_idx, g_idx, k_idx = valid.nonzero(as_tuple=True)
-
-        slot_idx = placement[l_idx, g_idx, k_idx]
-
-        pt_local[l_idx, g_idx, slot_idx] = k_idx
-
-        return pt_local
-
-    def local2global(self, placement_local: torch.Tensor) -> torch.Tensor:
-
-        L, G, E_local = placement_local.shape
-        device = placement_local.device
-
-        max_id = torch.max(placement_local)
-        E_global = (max_id + 1).item() if max_id >= 0 else 0
-
-        if E_global == 0:
-            return torch.empty((L, G, 0), dtype=torch.long, device=device)
-
-        placement_global = torch.full((L, G, E_global),
-                                      fill_value=-1,
-                                      dtype=torch.long,
-                                      device=device)
-
-        valid = placement_local >= 0
-        l_idx, g_idx, slot_idx = valid.nonzero(as_tuple=True)
-        gid_idx = placement_local[l_idx, g_idx, slot_idx]
-
-        placement_global[l_idx, g_idx, gid_idx] = slot_idx
-
-        return placement_global
-
-    def determine_expert_map_all(self):
-        if self.world_size == 1:
-            local_ids = torch.arange(self.global_expert_num, dtype=torch.int32)
-            return local_ids.view(1, 1, -1).expand(self.num_moe_layers, 1, -1)
-
-        local_num_experts = self.global_expert_num // self.world_size
-
-        expert_map_all = torch.full(
-            (self.num_moe_layers, self.world_size, self.global_expert_num),
-            -1,
-            dtype=torch.int32)
-
-        for r in range(self.world_size):
-            if r < self.world_size - 1:
-                start = r * local_num_experts
-                end = (r + 1) * local_num_experts
-                local_count = local_num_experts
-            else:
-                start = r * local_num_experts
-                end = self.global_expert_num
-                local_count = self.global_expert_num - r * local_num_experts
-
-            if r < self.init_redundancy_expert:
-                local_count += 1
-                if end < self.global_expert_num:
-                    end += 1
-                else:
-                    start -= 1
-
-            local_ids = torch.arange(local_count, dtype=torch.int32)
-            expert_map_all[:, r, start:end] = local_ids.unsqueeze(0).expand(
-                self.num_moe_layers, -1)
-
-        return expert_map_all
+        return torch.stack(all_layer_global_expert_map)

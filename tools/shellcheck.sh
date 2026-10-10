@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
@@ -19,13 +19,13 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/tools
 #
 
-set -e
+set -euo pipefail
 
 scversion="stable"
+shellcheck_args=(-S error -s bash)
 
 if [ -d "shellcheck-${scversion}" ]; then
-    PATH="$PATH:$(pwd)/shellcheck-${scversion}"
-    export PATH
+    export PATH="$PATH:$(pwd)/shellcheck-${scversion}"
 fi
 
 if ! [ -x "$(command -v shellcheck)" ]; then
@@ -34,12 +34,35 @@ if ! [ -x "$(command -v shellcheck)" ]; then
         exit 1
     fi
 
-    # automatic local install if linux x86_64
     wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${scversion?}/shellcheck-${scversion?}.linux.x86_64.tar.xz" | tar -xJv
-    PATH="$PATH:$(pwd)/shellcheck-${scversion}"
-    export PATH
+    export PATH="$PATH:$(pwd)/shellcheck-${scversion}"
 fi
 
-# should enable this
-# find . -path ./.git -prune -o -name "*.sh" -print0 \
-# | xargs -0 -I {} sh -c 'git check-ignore -q "{}" || shellcheck -s bash "{}"'
+if [ -n "${SHELLCHECK_OPTS:-}" ]; then
+    # Split caller-provided options the same way shell would.
+    # shellcheck disable=SC2206
+    extra_shellcheck_args=(${SHELLCHECK_OPTS})
+    shellcheck_args+=("${extra_shellcheck_args[@]}")
+fi
+
+if [ "$#" -eq 0 ]; then
+    while IFS= read -r tracked_file; do
+        shellcheck "${shellcheck_args[@]}" "$tracked_file"
+    done < <(git ls-files "*.sh")
+    exit 0
+fi
+
+for file in "$@"; do
+    if git check-ignore -q "$file"; then
+        continue
+    fi
+
+    case "$file" in
+        *.csh|*.tcsh)
+            # Skip C shell scripts because this checker only supports sh-like shells.
+            continue
+            ;;
+    esac
+
+    shellcheck "${shellcheck_args[@]}" "$file"
+done

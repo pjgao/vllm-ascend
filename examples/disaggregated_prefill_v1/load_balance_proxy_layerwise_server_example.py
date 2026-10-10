@@ -17,7 +17,7 @@
 # Prerequisites:
 # - Python 3.8+
 # - Install dependencies:
-#     pip install fastapi httpx uvicorn vllm
+#     pip install fastapi<0.124.0 httpx uvicorn vllm
 #
 # Step 1: Start Your Backend Servers
 # ----------------------------------
@@ -86,48 +86,53 @@
 
 import argparse
 import asyncio
+import copy
 import functools
 import heapq
 import ipaddress
+import json
 import os
 import sys
-import threading
 import uuid
 from contextlib import asynccontextmanager
-from typing import List
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from vllm.logger import init_logger
+
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
+    BATCH_KV_TRANSFER_PARAMS,
+)
 
 logger = init_logger(__name__)
 
 # Add uvloop for faster event loop if available
 try:
     import uvloop
+
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     pass
 
 
 class ServerState:
-
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.url = f'http://{host}:{port}/v1'
+        self.url = f"http://{host}:{port}/v1"
+        # Auto-completion for ipv6
         try:
             ip = ipaddress.ip_address(self.host)
             if isinstance(ip, ipaddress.IPv6Address):
-                self.url = f'http://[{host}]:{port}/v1'
+                self.url = f"http://[{host}]:{port}/v1"
         except Exception:
             pass
-        self.client = httpx.AsyncClient(timeout=None,
-                                        base_url=self.url,
-                                        limits=httpx.Limits(
-                                            max_connections=100000,
-                                            max_keepalive_connections=100000))
+        self.client = httpx.AsyncClient(
+            timeout=None,
+            base_url=self.url,
+            limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
+        )
         self.active_tokens = 0
         self.active_kv_cache = 0  # Only for prefiller
         self.active_requests = 0  # Number of active requests
@@ -136,14 +141,9 @@ class ServerState:
 
 
 class ProxyState:
-
     def __init__(self, prefiller_instances, decoder_instances):
-        self.prefillers: List[ServerState] = [
-            ServerState(h, p) for h, p in prefiller_instances
-        ]
-        self.decoders: List[ServerState] = [
-            ServerState(h, p) for h, p in decoder_instances
-        ]
+        self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
+        self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
         # Removed selection locks - no longer needed for synchronous methods
@@ -151,14 +151,17 @@ class ProxyState:
         # Initialize priority queues for efficient server selection
         # Each entry is (priority_score, server_index, server_reference)
         # Lower priority score = higher priority (less loaded)
-        self.prefiller_heap = [(0, i, server)
-                               for i, server in enumerate(self.prefillers)]
-        self.decoder_heap = [(0, i, server)
-                             for i, server in enumerate(self.decoders)]
+        self.prefiller_heap = [(0, i, server) for i, server in enumerate(self.prefillers)]
+        self.decoder_heap = [(0, i, server) for i, server in enumerate(self.decoders)]
         heapq.heapify(self.prefiller_heap)
         heapq.heapify(self.decoder_heap)
         self.req_id_future = {}
         self.req_data_dict = {}
+        self.metaserver_expected_ids = {}
+        self.metaserver_params = {}
+        self.metaserver_ready_events = {}
+        self.metaserver_dispatch_tasks = {}
+        self.metaserver_lock = asyncio.Lock()
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -166,23 +169,18 @@ class ProxyState:
         # Priority based on active_tokens and active_kv_cache
         priority = server.active_tokens + server.active_kv_cache * 0.3
         # Remove old entry and add new one
-        self.prefiller_heap = [(p, i, s) for p, i, s in self.prefiller_heap
-                               if i != server_idx]
-        heapq.heappush(self.prefiller_heap,
-                       (priority, server_idx, server))  # type: ignore
+        self.prefiller_heap = [(p, i, s) for p, i, s in self.prefiller_heap if i != server_idx]
+        heapq.heappush(self.prefiller_heap, (priority, server_idx, server))  # type: ignore
 
     def _update_decoder_priority(self, server_idx: int):
         """Update the priority of a decoder server in the heap."""
         server = self.decoders[server_idx]
         priority = server.active_tokens
         # Remove old entry and add new one
-        self.decoder_heap = [(p, i, s) for p, i, s in self.decoder_heap
-                             if i != server_idx]
-        heapq.heappush(self.decoder_heap,
-                       (priority, server_idx, server))  # type: ignore
+        self.decoder_heap = [(p, i, s) for p, i, s in self.decoder_heap if i != server_idx]
+        heapq.heappush(self.decoder_heap, (priority, server_idx, server))  # type: ignore
 
-    def abort_prefiller_request(self, server_idx: int,
-                                request_id):  # Changed to synchronous
+    def abort_prefiller_request(self, server_idx: int, request_id):  # Changed to synchronous
         """
         Mark a request as aborted. This will helps to release kv cache in
         prefiller node.
@@ -190,8 +188,7 @@ class ProxyState:
         # No lock needed - atomic operation
         self.prefillers[server_idx].aborted_requests.add(request_id)
 
-    def aquire_aborted_prefiller_requests(
-            self, server_idx: int):  # Changed to synchronous
+    def acquire_aborted_prefiller_requests(self, server_idx: int):  # Changed to synchronous
         """
         Get the set of aborted requests and clear it.
         This is used to release kv cache in prefiller node.
@@ -204,6 +201,23 @@ class ProxyState:
     async def next_req_id(self):
         async with self.req_id_lock:
             return str(uuid.uuid4())
+
+    def register_request_batch(self, parent_request_id, request_ids, req_data, request_length, api):
+        request_record = (copy.deepcopy(req_data), request_length, api, parent_request_id)
+        for request_id in request_ids:
+            self.req_data_dict[request_id] = request_record
+        self.metaserver_expected_ids[parent_request_id] = tuple(request_ids)
+        self.metaserver_params[parent_request_id] = {}
+        self.metaserver_ready_events[parent_request_id] = asyncio.Event()
+
+    async def cleanup_request_batch(self, parent_request_id):
+        async with self.metaserver_lock:
+            request_ids = self.metaserver_expected_ids.pop(parent_request_id, ())
+            for request_id in request_ids:
+                self.req_data_dict.pop(request_id, None)
+            self.metaserver_params.pop(parent_request_id, None)
+            self.metaserver_ready_events.pop(parent_request_id, None)
+            self.metaserver_dispatch_tasks.pop(parent_request_id, None)
 
     def select_prefiller(self, token_count):  # Changed to synchronous
         # No lock needed - entire function is atomic
@@ -268,41 +282,73 @@ class ProxyState:
 proxy_state = None
 
 
+def _validate_host(host: str, arg_name: str, index: int) -> None:
+    """Validate that a host argument is a well-formed IP address or hostname.
+
+    Catches shell-escaping typos where a missing space before a line-continuation
+    backslash concatenates adjacent values (e.g. ``192.0.0.3\\n192.0.0.3``).
+    """
+    # A valid IP (IPv4/IPv6) is accepted as-is.
+    try:
+        ipaddress.ip_address(host)
+        return
+    except ValueError:
+        pass
+    # A non-IP value whose labels are all digits is almost always a shell-escaping
+    # typo that concatenated two hosts (e.g. "192.0.0.3192.0.0.3"); anything else
+    # is treated as a hostname.
+    if host and not all(label.isdigit() for label in host.split(".")):
+        return
+    hint = (
+        "looks like a concatenated IP address; check for missing whitespace before line-continuation backslashes"
+        if host
+        else "must be a valid IP or hostname"
+    )
+    raise ValueError(f"Invalid host {host!r} in {arg_name}[{index}]: {hint}")
+
+
+def _validate_hosts(hosts: list, arg_name: str) -> None:
+    """Validate every host in *hosts*, raising ValueError on the first
+    malformed entry."""
+    for i, host in enumerate(hosts):
+        _validate_host(host, arg_name, i)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--prefiller-hosts",
-                        type=str,
-                        nargs="+",
-                        default=["localhost"])
-    parser.add_argument("--prefiller-ports",
-                        type=int,
-                        nargs="+",
-                        default=[8001])
-    parser.add_argument("--decoder-hosts",
-                        type=str,
-                        nargs="+",
-                        default=["localhost"])
+    parser.add_argument("--prefiller-hosts", type=str, nargs="+", default=["localhost"])
+    parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
+    parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
-    parser.add_argument("--max-retries",
-                        type=int,
-                        default=3,
-                        help="Maximum number of retries for HTTP requests")
+    parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
-        "--retry-delay",
-        type=float,
-        default=0.001,
-        help="Base delay (seconds) for exponential backoff retries")
+        "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
+    )
     args = parser.parse_args()
+    logger.info(
+        "Decoder hosts will access Proxy host:port/metaserver, ensure that %s can access %s:%s/metaserver",
+        set(args.decoder_hosts),
+        args.host,
+        args.port,
+    )
+    # Wildcard address is not allowed for layerwise connector
+    if args.host in ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"]:
+        raise ValueError(
+            f"Decoder hosts will access Proxy host:port/metaserver, to avoid configuration errors, "
+            f"the Wildcard Address {args.host} is not allowed for proxy"
+        )
+    # Validate host arguments so that shell-escaping typos
+    # (e.g. "192.0.0.3\\n192.0.0.3") are caught early with a clear
+    # message rather than producing a confusing runtime failure.
+    _validate_hosts(args.prefiller_hosts, "--prefiller-hosts")
+    _validate_hosts(args.decoder_hosts, "--decoder-hosts")
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
-        raise ValueError(
-            "Number of prefiller hosts must match number of prefiller ports")
+        raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
-        raise ValueError(
-            "Number of decoder hosts must match number of decoder ports")
-    args.prefiller_instances = list(
-        zip(args.prefiller_hosts, args.prefiller_ports))
+        raise ValueError("Number of decoder hosts must match number of decoder ports")
+    args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
 
@@ -310,11 +356,8 @@ def parse_args():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_state
-    proxy_state = ProxyState(global_args.prefiller_instances,
-                             global_args.decoder_instances)
-    print(
-        f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients."
-    )
+    proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
+    print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
     yield
     for p in proxy_state.prefillers:
         await p.client.aclose()
@@ -331,14 +374,12 @@ async def listen_for_disconnect(request: Request) -> None:
 
 
 def with_cancellation(handler_func):
-
     @functools.wraps(handler_func)
     async def wrapper(*args, **kwargs):
         request = kwargs["request"]
         handler_task = asyncio.create_task(handler_func(*args, **kwargs))
         cancellation_task = asyncio.create_task(listen_for_disconnect(request))
-        done, pending = await asyncio.wait([handler_task, cancellation_task],
-                                           return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait([handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         if handler_task in done:
@@ -351,15 +392,16 @@ def with_cancellation(handler_func):
 app = FastAPI(lifespan=lifespan)
 
 
-async def send_request_to_service(client: httpx.AsyncClient,
-                                  prefiller_id: int,
-                                  endpoint: str,
-                                  req_data: dict,
-                                  request_id: str,
-                                  max_retries: int = 3,
-                                  base_delay: float = 0.2):
-    aborted_requests = proxy_state.aquire_aborted_prefiller_requests(
-        prefiller_id)
+async def send_request_to_service(
+    client: httpx.AsyncClient,
+    prefiller_id: int,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    max_retries: int = 3,
+    base_delay: float = 0.2,
+):
+    proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
     req_data["stream"] = False
     req_data["max_tokens"] = 1
@@ -368,49 +410,38 @@ async def send_request_to_service(client: httpx.AsyncClient,
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
-    headers = {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id
-    }
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = await client.post(endpoint,
-                                         json=req_data,
-                                         headers=headers)
+            response = await client.post(endpoint, json=req_data, headers=headers)
             response.raise_for_status()
             if request_id in proxy_state.req_id_future:
                 result_future = proxy_state.req_id_future[request_id]
                 result_future.set_result(response.json()["kv_transfer_params"])
             return
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.warning(
-                f"Attempt {attempt} failed for {endpoint}: {str(e)}")
+            logger.warning("Attempt %s failed for %s: %s", attempt, endpoint, e)
             last_exc = e
             if attempt < max_retries:
-                await asyncio.sleep(base_delay * (2**(attempt - 1)))
+                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
-                logger.error(
-                    f"All {max_retries} attempts failed for {endpoint}.")
+                logger.error("All %s attempts failed for %s.", max_retries, endpoint)
                 raise last_exc
 
 
-async def stream_service_response_with_retry(client: httpx.AsyncClient,
-                                             endpoint: str,
-                                             req_data: dict,
-                                             request_id: str,
-                                             max_retries: int = 3,
-                                             base_delay: float = 0.2):
-    headers = {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id
-    }
+async def stream_service_response_with_retry(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    max_retries: int = 3,
+    base_delay: float = 0.2,
+):
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     for attempt in range(1, max_retries + 1):
         try:
-            async with client.stream("POST",
-                                     endpoint,
-                                     json=req_data,
-                                     headers=headers) as response:
+            async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
                 response.raise_for_status()
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
@@ -419,47 +450,42 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
-                logger.warning(
-                    f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}"
-                )
-                await asyncio.sleep(base_delay * (2**(attempt - 1)))
+                logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, e)
+                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
-                logger.error(
-                    f"All {max_retries} attempts failed for streaming {endpoint}."
-                )
+                logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
                 raise e
         except Exception as e:
             # If any chunk has been sent, do not retry, just log and drop
-            if 'first_chunk_sent' in locals() and first_chunk_sent:
-                logger.error(
-                    f"Streaming to client interrupted after response started: {str(e)}"
-                )
+            if "first_chunk_sent" in locals() and first_chunk_sent:
+                logger.error("Streaming to client interrupted after response started: %s", e)
                 return
             else:
                 if attempt < max_retries:
-                    logger.warning(
-                        f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}"
-                    )
-                    await asyncio.sleep(base_delay * (2**(attempt - 1)))
+                    logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, e)
+                    await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
                 else:
-                    logger.error(
-                        f"All {max_retries} attempts failed for streaming {endpoint}."
-                    )
+                    logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
                     raise e
 
 
-def get_api_request_id(api, req_id):
+def get_api_request_id(api, req_id, prompt_idx=0):
     if api == "/completions":
-        return "cmpl-" + req_id + "-0"
+        return f"cmpl-{req_id}-{prompt_idx}"
     elif api == "/chat/completions":
         return "chatcmpl-" + req_id
 
 
-def get_origin_request_id(api, req_id):
-    if api == "/completions":
-        return req_id.replace("cmpl-", "")[:-2]
-    elif api == "/chat/completions":
-        return req_id.replace("chatcmpl-", "")
+def get_api_request_ids(api, req_id, req_data):
+    if api != "/completions":
+        return [get_api_request_id(api, req_id)]
+
+    prompt = req_data.get("prompt")
+    # A list[int] is one tokenized prompt. A list[str] or list[list[int]] is
+    # expanded by vLLM into one child request per entry.
+    is_token_ids = isinstance(prompt, list) and all(isinstance(token, int) for token in prompt)
+    prompt_count = len(prompt) if isinstance(prompt, list) and prompt and not is_token_ids else 1
+    return [get_api_request_id(api, req_id, prompt_idx) for prompt_idx in range(prompt_count)]
 
 
 async def _handle_completions(api: str, request: Request):
@@ -468,16 +494,12 @@ async def _handle_completions(api: str, request: Request):
         req_body = await request.body()
         request_length = len(req_body)
         request_id = await proxy_state.next_req_id()
-        request_id_api = get_api_request_id(api, request_id)
-        proxy_state.req_data_dict[request_id_api] = (req_data, request_length,
-                                                     api)
-        req_data['kv_transfer_params'] = {
-            "do_remote_decode":
-            False,
-            "do_remote_prefill":
-            True,
-            "metaserver":
-            f"http://{global_args.host}:{global_args.port}/v1/metaserver"
+        request_ids_api = get_api_request_ids(api, request_id, req_data)
+        proxy_state.register_request_batch(request_id, request_ids_api, req_data, request_length, api)
+        req_data["kv_transfer_params"] = {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "metaserver": f"http://{global_args.host}:{global_args.port}/v1/metaserver",
         }
         # Select decoder
         decoder_score = proxy_state.calculate_decode_scores(request_length)
@@ -489,33 +511,116 @@ async def _handle_completions(api: str, request: Request):
         # Stream response from decoder
         released_kv = False
 
+        # Record request info for recompute
+        stream_flag = bool(req_data.get("stream", False))
+        chat_flag = "messages" in req_data
+        if "prompt" in req_data:
+            origin_prompt = req_data["prompt"]
+        elif chat_flag:
+            messages = req_data["messages"]
+            origin_prompt = messages[0].get("content", "")
+        else:
+            origin_prompt = ""
+        # refer to vLLM sampling_params: max_token default value
+        origin_max_tokens = req_data.get("max_tokens", 16)
+
         async def generate_stream():
             nonlocal released_kv
+            generated_token = ""
+            released_kv = False
+            retry_count = 0
+            retry = True
+            completion_tokens = 0
             # Only one await per chunk, minimal logic in loop
             try:
-                async for chunk in stream_service_response_with_retry(
+                while retry:
+                    retry = False
+                    async for chunk in stream_service_response_with_retry(
                         decoder.client,
                         api,
                         req_data,
                         request_id=request_id,
                         max_retries=global_args.max_retries,
-                        base_delay=global_args.retry_delay):
-                    yield chunk
+                        base_delay=global_args.retry_delay,
+                    ):
+                        try:
+                            chunk_str = chunk.decode("utf-8").strip()
+                        except UnicodeDecodeError:
+                            logger.debug("Skipping chunk: %s", chunk)
+                            yield chunk
+                            continue
+                        if not chunk_str:
+                            continue
+                        if chunk_str.startswith("data: "):
+                            chunk_str = chunk_str[len("data: ") :]
+                        try:
+                            chunk_json = json.loads(chunk_str)
+                        except json.JSONDecodeError:
+                            # if chunk is [done], skip it.
+                            logger.debug("Skipping chunk: %s", chunk_str)
+                            yield chunk
+                            continue
+                        choices = chunk_json.get("choices", [])
+                        if not choices:
+                            yield chunk
+                            continue
+
+                        choice = choices[0]
+                        delta = choice.get("delta") or {}
+                        message = choice.get("message") or {}
+                        content = delta.get("content") or message.get("content") or choice.get("text") or ""
+                        generated_token += content
+
+                        stop_reason = choice.get("stop_reason")
+                        usage = chunk_json.get("usage", {})
+                        completion_tokens = (
+                            (completion_tokens + 1)
+                            if stream_flag
+                            else (completion_tokens + usage.get("completion_tokens"))
+                        )
+                        if stop_reason == "recomputed":
+                            retry = True
+                            retry_count += 1
+                            if chat_flag:
+                                messages[0]["content"] = (
+                                    origin_prompt
+                                    + ([{"type": "text", "text": generated_token}] if generated_token else [])
+                                    if isinstance(origin_prompt, list)
+                                    else (origin_prompt or "") + generated_token
+                                )
+                            else:
+                                req_data["prompt"] = origin_prompt + generated_token
+                            req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+                            break
+                        if retry_count > 0 and not stream_flag:
+                            if chat_flag:
+                                choice["message"]["content"] = generated_token
+                            else:
+                                choice["text"] = generated_token
+                            chunk = json.dumps(chunk_json).encode("utf-8")
+                        yield chunk
             except Exception as e:
                 logger.error(
-                    f"Error during streaming from decoder {decoder.url}: {str(e)} the aborted request {request_id} will be routing to the target prefiller when new request is ready to dispatch to it"
+                    "Error during streaming from decoder %s: %s the aborted request %s "
+                    "will be routing to the target prefiller when new request is ready to dispatch to it",
+                    decoder.url,
+                    e,
+                    request_id,
                 )
+            finally:
+                # After streaming done, release tokens
+                proxy_state.release_decoder(decoder_idx, decoder_score)
+                await proxy_state.cleanup_request_batch(request_id)
 
-            # After streaming done, release tokens
-            proxy_state.release_decoder(decoder_idx, decoder_score)
-
-        return StreamingResponse(generate_stream(),
-                                 media_type="application/json")
+        if stream_flag:
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+        else:
+            return StreamingResponse(generate_stream(), media_type="application/json")
     except Exception as e:
         import traceback
+
         exc_info = sys.exc_info()
-        print("Error occurred in disagg prefill proxy server"
-              f" - {api} endpoint")
+        print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
@@ -538,49 +643,122 @@ async def healthcheck():
     return {
         "status": "ok",
         "prefill_instances": len(proxy_state.prefillers),
-        "decode_instances": len(proxy_state.decoders)
+        "decode_instances": len(proxy_state.decoders),
     }
 
 
-@app.post("/v1/metaserver")
-async def metaserver(request: Request):
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache(request: Request):
+    params = dict(request.query_params)
+    failures = []
+    for client, base_url in [
+        (s.client, f"http://{s.host}:{s.port}") for s in proxy_state.prefillers + proxy_state.decoders
+    ]:
+        try:
+            resp = await client.post(f"{base_url}/reset_prefix_cache", params=params)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error("reset_prefix_cache failed for %s: %s", base_url, e)
+            failures.append(base_url)
+    if failures:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=500, content={"failed": failures})
+    from fastapi.responses import Response as FastAPIResponse
+
+    return FastAPIResponse(status_code=200)
+
+
+async def dispatch_prefill_batch(
+    req_data,
+    request_length,
+    api,
+    parent_request_id,
+    expected_request_ids,
+    params_by_request_id,
+):
+    prefiller_score = proxy_state.calculate_prefill_scores(request_length)
+    logger.debug("Request length: %s, Prefiller score: %s", request_length, prefiller_score)
+    prefiller_idx = proxy_state.select_prefiller(prefiller_score)
     try:
-        kv_transfer_params = await request.json()
-
-        request_id = kv_transfer_params["request_id"]
-        assert request_id in proxy_state.req_data_dict
-        req_data, request_length, api = proxy_state.req_data_dict[request_id]
-        request_id = get_origin_request_id(api, request_id)
-        req_data["kv_transfer_params"] = kv_transfer_params
-        prefiller_score = proxy_state.calculate_prefill_scores(request_length)
-        logger.debug(
-            f"Request length: {request_length}, Prefiller score: {prefiller_score}"
-        )
-
-        # Select prefiller
-        prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
-        logger.debug(f"Using prefill {prefiller.url=} {req_data=}")
-        # Send request to prefiller
-        response = await send_request_to_service(
+        req_data = copy.deepcopy(req_data)
+        if len(expected_request_ids) == 1:
+            req_data["kv_transfer_params"] = params_by_request_id[expected_request_ids[0]]
+        else:
+            # vLLM expands a completion prompt list into cmpl-<parent>-N child
+            # requests. Preserve the per-child D endpoint/cache metadata while
+            # issuing the original prompt list to P exactly once.
+            kv_transfer_params = copy.deepcopy(params_by_request_id[expected_request_ids[0]])
+            kv_transfer_params[BATCH_KV_TRANSFER_PARAMS] = {
+                request_id: params_by_request_id[request_id] for request_id in expected_request_ids
+            }
+            req_data["kv_transfer_params"] = kv_transfer_params
+        logger.debug("Using prefill prefiller.url=%r req_data=%r", prefiller.url, req_data)
+        await send_request_to_service(
             prefiller.client,
             prefiller_idx,
             api,
             req_data,
-            request_id,
+            parent_request_id,
             max_retries=global_args.max_retries,
-            base_delay=global_args.retry_delay)
-        proxy_state.release_prefiller(prefiller_idx, prefiller_score)
-        proxy_state.release_prefiller_kv(prefiller_idx,prefiller_score)
-
-    except Exception as e:
-        logger.error(f"Post metaserver failed with: {str(e)}")
+            base_delay=global_args.retry_delay,
+        )
+    finally:
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
         proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
 
 
-if __name__ == '__main__':
+@app.post("/v1/metaserver")
+async def metaserver(request: Request):
+    kv_transfer_params = await request.json()
+    request_id = kv_transfer_params.get("request_id")
+    request_record = proxy_state.req_data_dict.get(request_id)
+    if request_record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown metaserver request_id: {request_id!r}")
+
+    req_data, request_length, api, parent_request_id = request_record
+    async with proxy_state.metaserver_lock:
+        params_by_request_id = proxy_state.metaserver_params[parent_request_id]
+        params_by_request_id[request_id] = kv_transfer_params
+        expected_request_ids = proxy_state.metaserver_expected_ids[parent_request_id]
+        dispatch_task = proxy_state.metaserver_dispatch_tasks.get(parent_request_id)
+        if dispatch_task is not None and dispatch_task.done():
+            if dispatch_task.cancelled() or dispatch_task.exception() is not None:
+                dispatch_task = None
+        if dispatch_task is None and all(
+            expected_request_id in params_by_request_id for expected_request_id in expected_request_ids
+        ):
+            dispatch_task = asyncio.create_task(
+                dispatch_prefill_batch(
+                    req_data,
+                    request_length,
+                    api,
+                    parent_request_id,
+                    expected_request_ids,
+                    copy.deepcopy(params_by_request_id),
+                )
+            )
+            proxy_state.metaserver_dispatch_tasks[parent_request_id] = dispatch_task
+            proxy_state.metaserver_ready_events[parent_request_id].set()
+        ready_event = proxy_state.metaserver_ready_events[parent_request_id]
+
+    if dispatch_task is None:
+        await ready_event.wait()
+        async with proxy_state.metaserver_lock:
+            dispatch_task = proxy_state.metaserver_dispatch_tasks[parent_request_id]
+
+    try:
+        await asyncio.shield(dispatch_task)
+    except Exception as error:
+        logger.exception("Post metaserver failed for parent request %s", parent_request_id)
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
     global global_args
     global_args = parse_args()
     import uvicorn
+
     uvicorn.run(app, host=global_args.host, port=global_args.port)

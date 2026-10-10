@@ -1,16 +1,18 @@
 # Using AISBench
-This document guides you to conduct accuracy testing using [AISBench](https://gitee.com/aisbench/benchmark/tree/master). AISBench provides accuracy and performance evaluation for many datasets.
+
+This document guides you to conduct accuracy testing using [AISBench](https://github.com/AISBench/benchmark/tree/master). AISBench provides accuracy and performance evaluation for many datasets.
 
 ## Online Server
+
 ### 1. Start the vLLM server
+
 You can run docker container to start the vLLM server on a single NPU:
 
-```{code-block} bash
-   :substitutions:
+```bash
 # Update DEVICE according to your device (/dev/davinci[0-7])
 export DEVICE=/dev/davinci7
 # Update the vllm-ascend image
-export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
+export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
 docker run --rm \
 --name vllm-ascend \
 --shm-size=1g \
@@ -33,32 +35,31 @@ docker run --rm \
 
 Run the vLLM server in the docker.
 
-```{code-block} bash
-   :substitutions:
-vllm serve Qwen/Qwen2.5-0.5B-Instruct --max_model_len 35000 &
+```bash
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 35000 &
 ```
 
-:::{note}
-`--max_model_len` should be greater than `35000`, this will be suitable for most datasets. Otherwise the accuracy evaluation may be affected.
-:::
+!!! note
+
+    `--max-model-len` should be greater than `35000`, this will be suitable for most datasets. Otherwise the accuracy evaluation may be affected.
 
 The vLLM server is started successfully, if you see logs as below:
 
-```
+```shell
 INFO:     Started server process [9446]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 ```
 
-### 2. Run different dataset using AISBench
+### 2. Run different datasets using AISBench
 
 #### Install AISBench
 
-Refer to [AISBench](https://gitee.com/aisbench/benchmark/tree/master) for details.
+Refer to [AISBench](https://github.com/AISBench/benchmark/tree/master) for details.
 Install AISBench from source.
 
 ```shell
-git clone https://gitee.com/aisbench/benchmark.git
+git clone https://github.com/AISBench/benchmark.git
 cd benchmark/
 pip3 install -e ./ --use-pep517
 ```
@@ -78,78 +79,79 @@ You can choose one or multiple datasets to execute accuracy evaluation.
 
 1. `C-Eval` dataset.
 
-Take `C-Eval` dataset as an example. And you can refer to [Datasets](https://gitee.com/aisbench/benchmark/tree/master/ais_bench/benchmark/configs/datasets) for more datasets. Every datasets have a `README.md` for detailed download and installation process.
+    Take `C-Eval` dataset as an example. You can refer to [Datasets](https://github.com/AISBench/benchmark/tree/master/ais_bench/benchmark/configs/datasets) for more datasets. Each dataset has a `README.md` with detailed download and installation instructions.
 
-Download dataset and install it to specific path.
+    Download dataset and install it to specific path.
 
-```shell
-cd ais_bench/datasets
-mkdir ceval/
-mkdir ceval/formal_ceval
-cd ceval/formal_ceval
-wget https://www.modelscope.cn/datasets/opencompass/ceval-exam/resolve/master/ceval-exam.zip
-unzip ceval-exam.zip
-rm ceval-exam.zip
-```
+    ```shell
+    cd ais_bench/datasets
+    mkdir ceval/
+    mkdir ceval/formal_ceval
+    cd ceval/formal_ceval
+    wget https://www.modelscope.cn/datasets/opencompass/ceval-exam/resolve/master/ceval-exam.zip
+    unzip ceval-exam.zip
+    rm ceval-exam.zip
+    ```
 
 2. `MMLU` dataset.
 
-```shell
-cd ais_bench/datasets
-wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/mmlu.zip
-unzip mmlu.zip
-rm mmlu.zip
-```
+    ```shell
+    cd ais_bench/datasets
+    wget https://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/mmlu.zip
+    unzip mmlu.zip
+    rm mmlu.zip
+    ```
 
 3. `GPQA` dataset.
 
-```shell
-cd ais_bench/datasets
-wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gpqa.zip
-unzip gpqa.zip
-rm gpqa.zip
-```
+    ```shell
+    cd ais_bench/datasets
+    wget https://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gpqa.zip
+    unzip gpqa.zip
+    rm gpqa.zip
+    ```
 
 4. `MATH` dataset.
 
-```shell
-cd ais_bench/datasets
-wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/math.zip
-unzip math.zip
-rm math.zip
-```
+    ```shell
+    cd ais_bench/datasets
+    wget https://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/math.zip
+    unzip math.zip
+    rm math.zip
+    ```
 
 5. `LiveCodeBench` dataset.
 
-```shell
-cd ais_bench/datasets
-git lfs install
-git clone https://huggingface.co/datasets/livecodebench/code_generation_lite
-```
+    ```shell
+    cd ais_bench/datasets
+    # If HuggingFace is slow or unreachable, set HF_ENDPOINT to a mirror:
+    # export HF_ENDPOINT=https://hf-mirror.com
+    huggingface-cli download livecodebench/code_generation_lite --repo-type dataset --local-dir code_generation_lite
+    ```
 
 6. `AIME 2024` dataset.
 
-```shell
-cd ais_bench/datasets
-mkdir aime/
-cd aime/
-wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/aime.zip
-unzip aime.zip
-rm aime.zip
-```
+    ```shell
+    cd ais_bench/datasets
+    mkdir aime/
+    cd aime/
+    wget https://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/aime.zip
+    unzip aime.zip
+    rm aime.zip
+    ```
 
 7. `GSM8K` dataset.
 
-```shell
-cd ais_bench/datasets
-wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gsm8k.zip
-unzip gsm8k.zip
-rm gsm8k.zip
-```
+    ```shell
+    cd ais_bench/datasets
+    wget https://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gsm8k.zip
+    unzip gsm8k.zip
+    rm gsm8k.zip
+    ```
 
 #### Configuration
 
-Update the file `benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py`.
+Update the file `ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py`.
 There are several arguments that you should update according to your environment.
 
 - `attr`: Identifier for the inference backend type, fixed as `service` (serving-based inference) or `local` (local model).
@@ -158,7 +160,7 @@ There are several arguments that you should update according to your environment
 - `path`: Update to your model weight path.
 - `model`: Update to your model name in vLLM.
 - `host_ip` and `host_port`: Update to your vLLM server ip and port.
-- `max_out_len`: Note `max_out_len` + LLM input length should be less than `max-model-len`(config in your vllm server), `32768` will be suitable for most datasets.
+- `max_out_len`: Note `max_out_len` + LLM input length should be less than `max_model_len` (config in your vllm server), `32768` will be suitable for most datasets.
 - `batch_size`: Update according to your dataset.
 - `temperature`: Update inference argument.
 
@@ -216,11 +218,14 @@ ais_bench --models vllm_api_general_chat --datasets livecodebench_code_generate_
 # run AIME 2024 dataset
 ais_bench --models vllm_api_general_chat --datasets aime2024_gen_0_shot_chat_prompt.py --mode all --dump-eval-details --merge-ds
 
+# run GSM8K dataset
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+
 ```
 
 After each dataset execution, you can get the result from saved files such as `outputs/default/20250628_151326`, there is an example as follows:
 
-```
+```shell
 20250628_151326/
 ├── configs # Combined configuration file for model tasks, dataset tasks, and result presentation tasks
 │   └── 20250628_151326_29317.py
@@ -265,6 +270,9 @@ ais_bench --models vllm_api_general_chat --datasets livecodebench_code_generate_
 
 # run AIME 2024 dataset
 ais_bench --models vllm_api_general_chat --datasets aime2024_gen_0_shot_chat_prompt.py --summarizer default_perf --mode perf
+
+# run GSM8K dataset
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_str_perf.py --summarizer default_perf --mode perf
 ```
 
 Multi-modal benchmarks (text + images):
@@ -276,7 +284,7 @@ ais_bench --models vllm_api_stream_chat --datasets textvqa_gen_base64 --summariz
 
 After execution, you can get the result from saved files, there is an example as follows:
 
-```
+```shell
 20251031_070226/
 |-- configs # Combined configuration file for model tasks, dataset tasks, and result presentation tasks
 |   `-- 20251031_070226_122485.py

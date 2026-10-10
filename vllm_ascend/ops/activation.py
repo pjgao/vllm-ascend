@@ -16,29 +16,71 @@
 #
 
 import torch
-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul
+import torch_npu
+from vllm.model_executor.layers.activation import (
+    QuickGELU,
+    SiluAndMul,
+    SiluAndMulWithClamp,
+    SwigluOAIAndMul,
+    SwigluStepAndMul,
+)
 
 
 class AscendQuickGELU(QuickGELU):
-
     def forward_oot(self, x: torch.tensor) -> torch.Tensor:
-        import torch_npu
-
         out = torch_npu.npu_fast_gelu(x)
         return out
 
 
 class AscendSiluAndMul(SiluAndMul):
-
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-        import torch_npu
-
-        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
-        torch.ops.vllm.maybe_prefetch_mlp_down_proj(x)
-        if get_ascend_device_type() == AscendDeviceType._310P:
-            out = torch_npu.npu_swiglu(x.to(torch.float32)).to(torch.float16)
-        else:
-            out = torch_npu.npu_swiglu(x)
-        torch.ops.vllm.maybe_wait_prefetch_done(out)
+        out = torch_npu.npu_swiglu(x)
         return out
+
+
+class AscendSiluAndMulWithClamp(SiluAndMulWithClamp):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
+        up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
+        x = torch.cat([gate, up], dim=-1)
+        out = torch_npu.npu_swiglu(x)
+        return out
+
+
+class AscendSwigluOAIAndMul:
+    def swiglu_oai_forward(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+        class MinimalSwigluOAIAndMul:
+            def __init__(self):
+                self.alpha = alpha
+                self.limit = limit
+
+        layer = MinimalSwigluOAIAndMul()
+        return SwigluOAIAndMul.forward_native(layer, x)
+
+
+class AscendSwigluStepAndMul:
+    def swiglustep_forward(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
+        if limit is None:
+            raise ValueError("SwigluStepAndMul requires limit to be set.")
+
+        # Triton fused path: 1D-grid row-loop kernel that fuses
+        # silu + clamp + mul into a single launch (see
+        # vllm_ascend/ops/triton/activation/swiglustep.py). Numerically
+        # equivalent to forward_native below.
+        from vllm.triton_utils import HAS_TRITON
+
+        if HAS_TRITON:
+            from vllm_ascend.ops.triton.activation.swiglustep import (
+                swiglustep_forward_triton,
+            )
+
+            return swiglustep_forward_triton(x, limit)
+
+        # Fallback when triton is unavailable: vllm's native silu+clamp+mul.
+        class MinimalSwigluStepAndMul:
+            def __init__(self):
+                self.limit = limit
+
+        layer = MinimalSwigluStepAndMul()
+        return SwigluStepAndMul.forward_native(layer, x)

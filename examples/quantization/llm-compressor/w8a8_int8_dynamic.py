@@ -1,10 +1,9 @@
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
 from llmcompressor.utils import dispatch_for_generation
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Select model and load it.
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -79,5 +78,5 @@ print("==========================================\n\n")
 
 # Save to disk compressed.
 SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-W8A8-Dynamic-Per-Token"
-model.save_pretrained(SAVE_DIR, save_compressed=True)
+model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size="5GB")
 tokenizer.save_pretrained(SAVE_DIR)

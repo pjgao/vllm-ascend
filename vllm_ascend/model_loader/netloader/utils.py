@@ -15,10 +15,33 @@
 #
 
 import os
-import re
 import socket
+from typing import Any
 
+import regex as re
 from vllm.logger import logger
+
+_DEFAULT_LOADER_EXTRA_KEYS = (
+    "enable_multithread_load",
+    "num_threads",
+    "enable_weights_track",
+)
+
+
+def disk_fallback_loader_extra_config(existing_extra: Any) -> dict[str, Any]:
+    """Extra config DefaultModelLoader accepts on a local-disk fallback.
+
+    Netloader extras carry SOURCE / LISTEN_PORT, which DefaultModelLoader
+    rejects, so the fallback used to drop the whole dict and silently lose the
+    user's multithread-load settings. Keep the keys DefaultModelLoader knows
+    and drop the rest. Defaults are left to vLLM.
+    """
+    kept: dict[str, Any] = {}
+    if isinstance(existing_extra, dict):
+        for key in _DEFAULT_LOADER_EXTRA_KEYS:
+            if key in existing_extra:
+                kept[key] = existing_extra[key]
+    return kept
 
 
 def find_free_port():
@@ -29,7 +52,7 @@ def find_free_port():
     - A free port number.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
+        s.bind(("", 0))
         return s.getsockname()[1]
 
 
@@ -47,20 +70,17 @@ def is_valid_path_prefix(path_prefix):
         return False
 
     if re.search(r'[<>:"|?*]', path_prefix):
-        logger.warning(
-            f'The path prefix {path_prefix} contains illegal characters.')
+        logger.warning("The path prefix %s contains illegal characters.", path_prefix)
         return False
 
-    if path_prefix.startswith('/') or path_prefix.startswith('\\'):
+    if path_prefix.startswith("/") or path_prefix.startswith("\\"):
         if not os.path.exists(os.path.dirname(path_prefix)):
-            logger.warning(
-                f'The directory for the path prefix {os.path.dirname(path_prefix)} does not exist.'
-            )
+            logger.warning("The directory for the path prefix %s does not exist.", os.path.dirname(path_prefix))
             return False
     else:
         if not os.path.exists(os.path.dirname(os.path.abspath(path_prefix))):
             logger.warning(
-                f'The directory for the path prefix {os.path.dirname(os.path.abspath(path_prefix))} does not exist.'
+                "The directory for the path prefix %s does not exist.", os.path.dirname(os.path.abspath(path_prefix))
             )
             return False
     return True

@@ -1,16 +1,14 @@
 # SOME DESCRIPTIVE TITLE.
-# Copyright (C) 2025, vllm-ascend team
-# This file is distributed under the same license as the vllm-ascend
-# package.
-# FIRST AUTHOR <EMAIL@ADDRESS>, 2025.
+# Copyright (C) 2026, vllm-ascend team
+# This file is distributed under the same license as the vllm-ascend package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
 #
-#, fuzzy
 msgid ""
 msgstr ""
 "Project-Id-Version: vllm-ascend\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2025-07-18 09:01+0800\n"
-"PO-Revision-Date: 2025-07-18 10:09+0800\n"
+"POT-Creation-Date: 2026-07-08 14:01+0000\n"
+"PO-Revision-Date: 2026-07-08 14:01+0000\n"
 "Last-Translator: \n"
 "Language-Team: zh_CN <LL@li.org>\n"
 "Language: zh_CN\n"
@@ -18,132 +16,295 @@ msgstr ""
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
-"Generated-By: Babel 2.17.0\n"
-"X-Generator: Poedit 3.5\n"
+"Generated-By: detect_po_changes.py\n"
 
-#: ../../quick_start.md:1
-msgid "Quickstart"
-msgstr "快速入门"
+msgid "# Quickstart"
+msgstr "# 快速开始"
 
-#: ../../quick_start.md:3
-msgid "Prerequisites"
-msgstr "先决条件"
+msgid "## Introduction"
+msgstr "## 简介"
 
-#: ../../quick_start.md:5
-msgid "Supported Devices"
-msgstr "支持的设备"
-
-#: ../../quick_start.md:6
 msgid ""
-"Atlas A2 Training series (Atlas 800T A2, Atlas 900 A2 PoD, Atlas 200T A2 "
-"Box16, Atlas 300T A2)"
-msgstr ""
-"Atlas A2 训练系列（Atlas 800T A2，Atlas 900 A2 PoD，Atlas 200T A2 Box16，"
-"Atlas 300T A2）"
+"This section guides you through container-based environment setup and large "
+"model inference, using the Qwen3-0.6B offline single-GPU inference script as"
+" an example."
+msgstr "本节将指导您完成基于容器的环境搭建和大模型推理，以 Qwen3-0.6B 离线单卡推理脚本为例。"
 
-#: ../../quick_start.md:7
-msgid "Atlas 800I A2 Inference series (Atlas 800I A2)"
-msgstr "Atlas 800I A2 推理系列（Atlas 800I A2）"
+msgid "## Prerequisites"
+msgstr "## 前提条件"
 
-#: ../../quick_start.md:9
-msgid "Setup environment using container"
-msgstr "使用容器设置环境"
+msgid "### Supported Devices"
+msgstr "### 支持的设备"
 
-#: ../../quick_start.md
-msgid "Ubuntu"
-msgstr "Ubuntu"
+msgid "## Requirements"
+msgstr "## 环境要求"
 
-#: ../../quick_start.md
-msgid "openEuler"
-msgstr "openEuler"
+msgid "## Setup environment using container"
+msgstr "## 使用容器搭建环境"
 
-#: ../../quick_start.md:69
 msgid ""
-"The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed "
-"in `/vllm-workspace` and installed in [development mode](https://setuptools."
-"pypa.io/en/latest/userguide/development_mode.html)(`pip install -e`) to "
-"help developer immediately take place changes without requiring a new "
-"installation."
+"The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed in"
+" `/vllm-workspace` and installed in [development "
+"mode](https://setuptools.pypa.io/en/latest/userguide/development_mode.html) "
+"(`pip install -e`) to help developers make changes effective immediately "
+"without requiring a new installation."
 msgstr ""
-"默认的工作目录是 `/workspace`，vLLM 和 vLLM Ascend 代码被放置在 `/vllm-"
-"workspace`，并以[开发模式](https://setuptools.pypa.io/en/latest/userguide/"
-"development_mode.html)（`pip install -e`）安装，以便开发者能够即时生效更改，"
-"而无需重新安装。"
+"默认工作目录为 `/workspace`，vLLM 和 vLLM Ascend 代码放置在 `/vllm-workspace` "
+"中，并以[开发模式](https://setuptools.pypa.io/en/latest/userguide/development_mode.html)（`pip"
+" install -e`）安装，以便开发者修改后立即生效，无需重新安装。"
 
-#: ../../quick_start.md:71
-msgid "Usage"
-msgstr "用法"
+msgid "## Usage"
+msgstr "## 使用方法"
 
-#: ../../quick_start.md:73
-msgid "You can use Modelscope mirror to speed up download:"
-msgstr "你可以使用 Modelscope 镜像来加速下载："
+msgid "You can use ModelScope mirror to speed up download:"
+msgstr "您可以使用 ModelScope 镜像加速下载："
 
-#: ../../quick_start.md:80
 msgid "There are two ways to start vLLM on Ascend NPU:"
 msgstr "在昇腾 NPU 上启动 vLLM 有两种方式："
 
-#: ../../quick_start.md
-msgid "Offline Batched Inference"
-msgstr "离线批量推理"
+msgid "=== \"Offline Batched Inference\""
+msgstr "=== \"离线批量推理\""
 
-#: ../../quick_start.md:86
 msgid ""
 "With vLLM installed, you can start generating texts for list of input "
-"prompts (i.e. offline batch inferencing)."
-msgstr ""
-"安装了 vLLM 后，您可以开始为一系列输入提示生成文本（即离线批量推理）。"
+"prompts (i.e. offline batch inference)."
+msgstr "安装 vLLM 后，您可以开始为输入提示列表生成文本（即离线批量推理）。"
 
-#: ../../quick_start.md:88
+msgid "Create and run a simple inference test. The `example.py` can be like:"
+msgstr "创建并运行一个简单的推理测试。`example.py` 的内容可以如下："
+
+msgid "Then run:"
+msgstr "然后运行："
+
 msgid ""
-"Try to run below Python script directly or use `python3` shell to generate "
-"texts:"
+"If you encounter a connection error with Hugging Face (e.g., `We couldn't "
+"connect to 'https://huggingface.co' to load the files, and couldn't find "
+"them in the cached files.`), run the following commands to use ModelScope as"
+" an alternative:"
 msgstr ""
-"尝试直接运行下面的 Python 脚本，或者使用 `python3` 交互式命令行来生成文本："
+"如果遇到与 Hugging Face 的连接错误（例如 `We couldn't connect to 'https://huggingface.co'"
+" to load the files, and couldn't find them in the cached files.`），请运行以下命令以使用"
+" ModelScope 作为替代："
 
-#: ../../quick_start.md
-msgid "OpenAI Completions API"
-msgstr "OpenAI Completions API"
+msgid "This section shows ascend platform is successfully detected in vllm:"
+msgstr "以下部分显示 vllm 已成功检测到昇腾平台："
 
-#: ../../quick_start.md:114
+msgid "This section shows the final output:"
+msgstr "以下部分显示最终输出："
+
 msgid ""
-"vLLM can also be deployed as a server that implements the OpenAI API "
-"protocol. Run the following command to start the vLLM server with the [Qwen/"
-"Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) "
-"model:"
+"This section shows process exits after offline inference, and does not "
+"affect actual inference:"
+msgstr "以下部分显示离线推理后进程退出，不影响实际推理："
+
+msgid "=== \"OpenAI Completions API\""
+msgstr "=== \"OpenAI Completions API\""
+
+msgid ""
+"vLLM can also be deployed as a server that implements the OpenAI API protocol. Run\n"
+"    the following command to start the vLLM server with the\n"
+"    [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) model:"
 msgstr ""
-"vLLM 也可以作为实现 OpenAI API 协议的服务器进行部署。运行以下命令，使用 "
-"[Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-"
-"Instruct) 模型启动 vLLM 服务器："
+"vLLM 也可以部署为实现了 OpenAI API 协议的服务器。运行\n"
+"    以下命令，使用\n"
+"    [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) 模型启动 vLLM 服务器："
 
-#: ../../quick_start.md:124
-msgid "If you see log as below:"
-msgstr "如果你看到如下日志："
+msgid "If you see a log as below:"
+msgstr "如果您看到如下日志："
 
-#: ../../quick_start.md:132
 msgid "Congratulations, you have successfully started the vLLM server!"
-msgstr "恭喜，你已经成功启动了 vLLM 服务器！"
+msgstr "恭喜，您已成功启动 vLLM 服务器！"
 
-#: ../../quick_start.md:134
-msgid "You can query the list the models:"
-msgstr "你可以查询模型列表："
+msgid "You can query the list of models:"
+msgstr "您可以查询模型列表："
 
-#: ../../quick_start.md:141
 msgid "You can also query the model with input prompts:"
-msgstr "你也可以通过输入提示来查询模型："
+msgstr "您也可以使用输入提示查询模型："
 
-#: ../../quick_start.md:155
 msgid ""
-"vLLM is serving as background process, you can use `kill -2 $VLLM_PID` to "
-"stop the background process gracefully, it's equal to `Ctrl-C` to stop "
-"foreground vLLM process:"
+"vLLM is serving as a background process, you can use `kill -2 $VLLM_PID` to "
+"stop the background process gracefully, which is similar to `Ctrl-C` for "
+"stopping the foreground vLLM process:"
 msgstr ""
-"vLLM 正作为后台进程运行，你可以使用 `kill -2 $VLLM_PID` 来优雅地停止后台进"
-"程，这等同于使用 `Ctrl-C` 停止前台 vLLM 进程："
+"vLLM 作为后台进程运行，您可以使用 `kill -2 $VLLM_PID` 优雅地停止后台进程，这类似于使用 `Ctrl-C` 停止前台 vLLM "
+"进程："
 
-#: ../../quick_start.md:164
-msgid "You will see output as below:"
-msgstr "你将会看到如下输出："
+msgid "The output is as below:"
+msgstr "输出如下："
 
-#: ../../quick_start.md:172
-msgid "Finally, you can exit container by using `ctrl-D`."
-msgstr "最后，你可以通过按 `ctrl-D` 退出容器。"
+msgid "Finally, you can exit the container by using `ctrl-D`."
+msgstr "最后，您可以使用 `ctrl-D` 退出容器。"
+
+msgid ""
+"| Software      | Supported version                | Note"
+"                                      |"
+msgstr ""
+"| 软件          | 支持的版本                       | 备注"
+"                                      |"
+
+msgid "=== \"Ubuntu (A2)\""
+msgstr "=== \"Ubuntu (A2)\""
+
+msgid "=== \"Ubuntu (A3)\""
+msgstr "=== \"Ubuntu (A3)\""
+
+msgid "=== \"openEuler (A2)\""
+msgstr "=== \"openEuler (A2)\""
+
+msgid "=== \"openEuler (A3)\""
+msgstr "=== \"openEuler (A3)\""
+
+msgid ""
+"Atlas 200I Pro requires additional device nodes and driver mounts. See [Set "
+"up using Docker](installation.md#set-up-using-docker) for the complete "
+"container commands."
+msgstr ""
+"Atlas 200I Pro需要额外的设备节点和驱动挂载。完整的容器命令请参见[使用Docker设置](installation.md#set-up-"
+"using-docker)。"
+
+msgid ""
+"- For details on using different models, see the corresponding model tutorial in the \"Model Tutorials\" directory, for example, [Qwen3-30B-A3B](tutorials/models/Qwen3-30B-A3B.md).\n"
+"- For details on using different functions, see the corresponding function tutorial in the \"Function Tutorials\" directory, for example, [Prefill-Decode Disaggregation (DeepSeek)](tutorials/features/pd_disaggregation_mooncake_multi_node.md)."
+msgstr ""
+"- 有关使用不同模型的详细信息，请参阅“模型教程”目录中相应的模型教程，例如，[Qwen3-30B-A3B](tutorials/models/Qwen3-30B-A3B.md)。\n"
+"- 有关使用不同功能的详细信息，请参阅“功能教程”目录中相应的功能教程，例如，[预填充-解码分离（DeepSeek）](tutorials/features/pd_disaggregation_mooncake_multi_node.md)。"
+
+msgid ""
+"- OS: Linux\n"
+"- Python: >= 3.10, < 3.13\n"
+"- Hardware with Ascend NPUs. It's usually the Atlas 800 A2 series and Atlas 300I DUO.\n"
+"- Software:"
+msgstr ""
+"- 操作系统：Linux\n"
+"- Python：>= 3.10, < 3.13\n"
+"- 配备昇腾NPU的硬件。通常是Atlas 800 A2系列和Atlas 300I DUO。\n"
+"- 软件："
+
+msgid "=== \"Atlas 300I DUO\""
+msgstr "=== \"Atlas 300I DUO\""
+
+msgid ""
+"        | triton / triton-ascend | Not supported          | Uninstalled in "
+"`Dockerfile.310p` |"
+msgstr ""
+"        | triton / triton-ascend | 不支持          | 在 `Dockerfile.310p` 中已卸载 |"
+
+msgid "!!! note \"Atlas 300I DUO\""
+msgstr "!!! note \"Atlas 300I DUO\""
+
+msgid ""
+"Atlas 300I DUO uses `float16`. Use the `-310p` image suffix for Ubuntu or "
+"`-310p-openeuler` for openEuler. Atlas 300I DUO does not support `triton` or"
+" `triton-ascend`."
+msgstr ""
+"Atlas 300I DUO 使用 `float16`。对于 Ubuntu 使用 `-310p` 镜像后缀，对于 openEuler 使用 "
+"`-310p-openeuler`。Atlas 300I DUO 不支持 `triton` 或 `triton-ascend`。"
+
+msgid ""
+"Atlas 300I DUO and Atlas 200I Pro do not support `enable_npugraph_ex`. Set "
+"--additional-config '{\"ascend_compilation_config\": "
+"{\"enable_npugraph_ex\":false}}'."
+msgstr ""
+"Atlas 300I DUO 和 Atlas 200I Pro 不支持 `enable_npugraph_ex`。请设置 --additional-"
+"config '{\"ascend_compilation_config\": {\"enable_npugraph_ex\":false}}'。"
+
+msgid "=== \"Ubuntu (Atlas 300I DUO)\""
+msgstr "=== \"Ubuntu（Atlas 300I DUO）\""
+
+msgid ""
+"The following command applies to Atlas 300I DUO. For Atlas 200I Pro, use the"
+" additional device nodes and driver mounts documented in "
+"[Installation](installation.md#set-up-using-docker)."
+msgstr ""
+"以下命令适用于 Atlas 300I DUO。对于 Atlas 200I Pro，请使用 [安装](installation.md#set-up-"
+"using-docker) 中记录的额外设备节点和驱动挂载。"
+
+msgid "=== \"openEuler (Atlas 300I DUO)\""
+msgstr "=== \"openEuler（Atlas 300I DUO）\""
+
+msgid ""
+"- Atlas A2 training series (Atlas 800T A2, Atlas 900 A2 PoD, Atlas 200T A2 Box16, Atlas 300T A2)\n"
+"- Atlas 800I A2 inference series (Atlas 800I A2)\n"
+"- Atlas A3 training series (Atlas 800T A3, Atlas 900 A3 SuperPoD, Atlas 9000 A3 SuperPoD)\n"
+"- Atlas 800I A3 inference series (Atlas 800I A3)\n"
+"- Atlas 950DT inference series (Atlas 950DT)\n"
+"- Atlas 300I DUO\n"
+"- Atlas 200I Pro"
+msgstr ""
+"- Atlas A2训练系列（Atlas 800T A2、Atlas 900 A2 PoD、Atlas 200T A2 Box16、Atlas 300T A2）\n"
+"- Atlas 800I A2推理系列（Atlas 800I A2）\n"
+"- Atlas A3训练系列（Atlas 800T A3、Atlas 900 A3 SuperPoD、Atlas 9000 A3 SuperPoD）\n"
+"- Atlas 800I A3推理系列（Atlas 800I A3）\n"
+"- Atlas 950DT推理系列（Atlas 950DT）\n"
+"- Atlas 300I DUO\n"
+"- Atlas 200I Pro"
+
+msgid "=== \"Atlas A2/A3/950DT inference products\""
+msgstr "=== \"Atlas A2/A3/950DT推理产品\""
+
+msgid ""
+"        | torch         | == 2.10.0                       | Required for "
+"TorchNPU and vllm, No need to install manually, it will be auto installed in"
+" below steps |"
+msgstr ""
+"        | torch         | == 2.10.0                       | "
+"TorchNPU和vllm所需，无需手动安装，将在以下步骤中自动安装 |"
+
+msgid ""
+"Before using containers, make sure Docker is installed on your system. If "
+"Docker is not installed, please refer to the [Docker installation "
+"guide](https://docs.docker.com/get-started/get-docker/) for installation "
+"instructions."
+msgstr ""
+"在使用容器之前，请确保系统已安装Docker。如果未安装Docker，请参考[Docker安装指南](https://docs.docker.com/get-"
+"started/get-docker/)获取安装说明。"
+
+msgid "=== \"Ubuntu (Atlas 950DT)\""
+msgstr "=== \"Ubuntu（Atlas 950DT）\""
+
+msgid "=== \"openEuler (Atlas 950DT)\""
+msgstr "=== \"openEuler（Atlas 950DT）\""
+
+msgid ""
+"        | Ascend HDK    | Refer to the documentation [CANN "
+"9.1.0](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/releasenote/9.1.0/release-"
+"notes.md) | Required for CANN |"
+msgstr ""
+"        | Ascend HDK    | 参考文档 [CANN "
+"9.1.0](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/releasenote/9.1.0/release-"
+"notes.md) | CANN 所需 |"
+
+msgid ""
+"        | CANN          | == 9.1.0                        | Required for "
+"vllm-ascend and TorchNPU    |"
+msgstr ""
+"        | CANN          | == 9.1.0                        | vllm-ascend 和 "
+"TorchNPU 所需    |"
+
+msgid ""
+"        | TorchNPU     | == 2.10.0.post4                 | Required for "
+"vllm-ascend, No need to install manually, it will be auto installed in below"
+" steps |"
+msgstr ""
+"        | TorchNPU     | == 2.10.0.post4                 | vllm-ascend "
+"所需，无需手动安装，将在以下步骤中自动安装 |"
+
+msgid ""
+"        | NNAL          | == 9.1.0                        | Required for "
+"libatb.so, enables advanced tensor operations |"
+msgstr ""
+"        | NNAL          | == 9.1.0                        | libatb.so "
+"所需，支持高级张量操作 |"
+
+msgid ""
+"        | CANN          | == 9.1.0                 | Required for vllm-"
+"ascend and TorchNPU    |"
+msgstr ""
+"        | CANN          | == 9.1.0                 | vllm-ascend 和 TorchNPU "
+"所需    |"
+
+msgid ""
+"        | NNAL          | == 9.1.0                 | Required for libatb.so,"
+" enables advanced tensor operations |"
+msgstr ""
+"        | NNAL          | == 9.1.0                 | libatb.so 所需，支持高级张量操作 |"

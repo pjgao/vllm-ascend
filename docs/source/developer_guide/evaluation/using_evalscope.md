@@ -1,17 +1,16 @@
 # Using EvalScope
 
-This document will guide you have model inference stress testing and accuracy testing using [EvalScope](https://github.com/modelscope/evalscope).
+This document will guide you through model inference stress testing and accuracy testing using [EvalScope](https://github.com/modelscope/evalscope).
 
 ## 1. Online server
 
 You can run docker container to start the vLLM server on a single NPU:
 
-```{code-block} bash
-   :substitutions:
+```bash
 # Update DEVICE according to your device (/dev/davinci[0-7])
 export DEVICE=/dev/davinci7
 # Update the vllm-ascend image
-export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
+export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
 docker run --rm \
 --shm-size=1g \
 --name vllm-ascend \
@@ -34,7 +33,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct --max_model_len 26240
 
 If the vLLM server is started successfully, you can see information shown below:
 
-```
+```shell
 INFO:     Started server process [6873]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
@@ -42,13 +41,13 @@ INFO:     Application startup complete.
 
 Once your server is started, you can query the model with input prompts in a new terminal:
 
-```
+```shell
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "Qwen/Qwen2.5-7B-Instruct",
         "prompt": "The future of AI is",
-        "max_tokens": 7,
+        "max_completion_tokens": 7,
         "temperature": 0
     }'
 ```
@@ -65,14 +64,14 @@ pip install gradio plotly evalscope
 
 ## 3. Run GSM8K using EvalScope for accuracy testing
 
-You can use `evalscope eval` to run GSM8K for accuracy testing:
+You can use `evalscope eval` to run GSM8K (a grade-school math benchmark dataset) for accuracy testing:
 
-```
+```shell
 evalscope eval \
  --model Qwen/Qwen2.5-7B-Instruct \
  --api-url http://localhost:8000/v1 \
  --api-key EMPTY \
- --eval-type service \
+ --eval-type server \
  --datasets gsm8k \
  --limit 10
 ```
@@ -87,7 +86,7 @@ After 1 to 2 minutes, the output is shown below:
 +---------------------+-----------+-----------------+----------+-------+---------+---------+
 ```
 
-See more detail in [EvalScope doc - Model API Service Evaluation](https://evalscope.readthedocs.io/en/latest/get_started/basic_usage.html#model-api-service-evaluation).
+See more details in [EvalScope doc - Model API Service Evaluation](https://evalscope.readthedocs.io/en/latest/get_started/basic_usage.html#model-api-service-evaluation).
 
 ## 4. Run model inference stress testing using EvalScope
 
@@ -101,7 +100,7 @@ pip install evalscope[perf] -U
 
 You can use `evalscope perf` to run perf testing:
 
-```
+```shell
 evalscope perf \
     --url "http://localhost:8000/v1/chat/completions" \
     --parallel 5 \

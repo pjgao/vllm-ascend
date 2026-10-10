@@ -23,7 +23,6 @@ import os
 import subprocess
 import sys
 from sysconfig import get_paths
-from typing import Dict, List
 
 from setuptools import Command, Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
@@ -45,19 +44,18 @@ ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
 
 
-def check_or_set_default_env(cmake_args,
-                             env_name,
-                             env_variable,
-                             default_path=""):
+def check_or_set_default_env(cmake_args, env_name, env_variable, default_path=""):
     if env_variable is None:
         logging.warning(
-            f"No {env_name} found in your environment, pleause try to set {env_name} "
-            "if you customize the installation path of this library, otherwise default "
-            "path will be adapted during build this project")
-        logging.warning(f"Set default {env_name}: {default_path}")
+            "No %s found in your environment, please try to set %s if you customize the installation path of this "
+            "library, otherwise default path will be adapted during build this project",
+            env_name,
+            env_name,
+        )
+        logging.warning("Set default %s: %s", env_name, default_path)
         env_variable = default_path
     else:
-        logging.info(f"Found existing {env_name}: {env_variable}")
+        logging.info("Found existing %s: %s", env_name, env_variable)
     # cann package seems will check this environments in cmake, need write this env variable back.
     if env_name == "ASCEND_HOME_PATH":
         os.environ["ASCEND_HOME_PATH"] = env_variable
@@ -65,25 +63,44 @@ def check_or_set_default_env(cmake_args,
     return cmake_args
 
 
-def get_value_from_lines(lines: List[str], key: str) -> str:
+def get_value_from_lines(lines: list[str], key: str) -> str:
     for line in lines:
-        line = ' '.join(line.split())
+        line = " ".join(line.split())
         if key in line:
-            return line.split(':')[-1].strip()
+            return line.split(":")[-1].strip()
     return ""
 
 
 def get_chip_type() -> str:
     try:
-        npu_info_lines = subprocess.check_output(
-            ['npu-smi', 'info', '-l']).decode().strip().split('\n')
-        npu_id = int(get_value_from_lines(npu_info_lines, 'NPU ID'))
-        chip_info_lines = subprocess.check_output(
-            ['npu-smi', 'info', '-t', 'board', '-i',
-             str(npu_id), '-c', '0']).decode().strip().split('\n')
-        chip_name = get_value_from_lines(chip_info_lines, 'Chip Name')
-        chip_type = get_value_from_lines(chip_info_lines, 'Chip Type')
-        npu_name = get_value_from_lines(chip_info_lines, 'NPU Name')
+        # Get NPU ID
+        npu_info_lines = subprocess.check_output(["npu-smi", "info", "-l"]).decode().strip().split("\n")
+        npu_id = int(get_value_from_lines(npu_info_lines, "NPU ID"))
+
+        # Stage 1: query board info without -c flag
+        board_info_lines = (
+            subprocess.check_output(["npu-smi", "info", "-t", "board", "-i", str(npu_id)]).decode().strip().split("\n")
+        )
+
+        # Check if Chip Name exists (Ascend950 includes it directly)
+        chip_name = get_value_from_lines(board_info_lines, "Chip Name")
+
+        # Stage 2: query with -c flag only if Chip Name not found (A2/A3/310P)
+        if not chip_name:
+            chip_info_lines = (
+                subprocess.check_output(["npu-smi", "info", "-t", "board", "-i", str(npu_id), "-c", "0"])
+                .decode()
+                .strip()
+                .split("\n")
+            )
+        else:
+            # Ascend950 already has complete info
+            chip_info_lines = board_info_lines
+
+        # Extract required fields
+        chip_name = get_value_from_lines(chip_info_lines, "Chip Name")
+        chip_type = get_value_from_lines(chip_info_lines, "Chip Type")
+        npu_name = get_value_from_lines(chip_info_lines, "NPU Name")
 
         if "310" in chip_name:
             # 310P case
@@ -97,12 +114,15 @@ def get_chip_type() -> str:
             else:
                 # A3 case
                 assert npu_name
-                return (chip_name + '_' + npu_name).lower()
+                return (chip_name + "_" + npu_name).lower()
+        elif "950" in chip_name:
+            assert npu_name
+            return (chip_name + "_" + npu_name).lower()
+        elif "a2g3" in chip_name.lower():
+            # A2 case: CH version of the HDK
+            return "ascend910b1"
         else:
-            # TODO(zzzzwwjj): Currently, A5's chip name has not determined yet.
-            raise ValueError(
-                f"Unable to recognize chip name: {chip_name}, please manually set env SOC_VERSION"
-            )
+            raise ValueError(f"Unable to recognize chip name: {chip_name}, please manually set env SOC_VERSION")
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Get chip info failed: {e}")
     except FileNotFoundError:
@@ -112,91 +132,52 @@ def get_chip_type() -> str:
         return ""
 
 
-envs = load_module_from_path("envs",
-                             os.path.join(ROOT_DIR, "vllm_ascend", "envs.py"))
-
-soc_version = get_chip_type()
+envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm_ascend", "envs.py"))
+hardware = load_module_from_path(
+    "vllm_ascend_hardware",
+    os.path.join(ROOT_DIR, "vllm_ascend", "device", "hardware.py"),
+)
 
 if not envs.SOC_VERSION:
+    soc_version = get_chip_type()
     if not soc_version:
         raise RuntimeError(
             "Could not determine chip type automatically via 'npu-smi'. "
             "This can happen in a CPU-only environment. "
-            "Please set the 'SOC_VERSION' environment variable to specify the target chip."
+            "Please set the 'SOC_VERSION' environment variable to specify the target chip, for example:\n"
+            '  - Atlas A2: export SOC_VERSION="ascend910b1"\n'
+            '  - Atlas A3: export SOC_VERSION="ascend910_9391"\n'
+            '  - Atlas 300I: export SOC_VERSION="ascend310p1"\n'
+            '  - Atlas A5: export SOC_VERSION="<value starting with ascend950>"\n'
+            "You can also refer to the SOC_VERSION defaults in Dockerfile*."
         )
     envs.SOC_VERSION = soc_version
-else:
-    if soc_version and envs.SOC_VERSION != soc_version:
-        logging.warning(
-            f"env SOC_VERSION: {envs.SOC_VERSION} is not equal to soc_version from npu-smi: {soc_version}"
-        )
 
 
 def gen_build_info():
     soc_version = envs.SOC_VERSION
-
-    # TODO(zzzzwwjj): Add A5 case
-    soc_to_device = {
-        "910b": "_910B",
-        "910c": "_910_93",
-        "310p": "_310P",
-        "ascend910b1": "_910B",
-        "ascend910b2": "_910B",
-        "ascend910b2c": "_910B",
-        "ascend910b3": "_910B",
-        "ascend910b4": "_910B",
-        "ascend910b4-1": "_910B",
-        "ascend910_9391": "_910_93",
-        "ascend910_9381": "_910_93",
-        "ascend910_9372": "_910_93",
-        "ascend910_9392": "_910_93",
-        "ascend910_9382": "_910_93",
-        "ascend910_9362": "_910_93",
-        "ascend310p1": "_310P",
-        "ascend310p3": "_310P",
-        "ascend310p5": "_310P",
-        "ascend310p7": "_310P",
-        "ascend310p3vir01": "_310P",
-        "ascend310p3vir02": "_310P",
-        "ascend310p3vir04": "_310P",
-        "ascend310p3vir08": "_310P",
-    }
-
-    assert soc_version in soc_to_device, f"Undefined soc_version: {soc_version}. Please file an issue to vllm-ascend."
-    device_type = soc_to_device[soc_version]
-
-    if device_type == "_310P" and not envs.COMPILE_CUSTOM_KERNELS:
-        raise ValueError(
-            "device type 310P only supports custom kernels. Please set COMPILE_CUSTOM_KERNELS=1 to enable custom kernels."
-        )
+    device_type = hardware.device_type_from_soc_version(soc_version).name
 
     package_dir = os.path.join(ROOT_DIR, "vllm_ascend", "_build_info.py")
     with open(package_dir, "w+") as f:
-        f.write('# Auto-generated file\n')
+        f.write("# Auto-generated file\n")
         f.write(f"__device_type__ = '{device_type}'\n")
-        f.write(f"__sleep_mode_enabled__ = {envs.COMPILE_CUSTOM_KERNELS}\n")
-    logging.info(f"Generated _build_info.py with SOC version: {soc_version}")
+    logging.info("Generated _build_info.py with SOC version: %s", soc_version)
 
 
 class CMakeExtension(Extension):
-
-    def __init__(self,
-                 name: str,
-                 cmake_lists_dir: str = ".",
-                 **kwargs) -> None:
+    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwargs) -> None:
         super().__init__(name, sources=[], py_limited_api=False, **kwargs)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
 class custom_develop(develop):
-
     def run(self):
         gen_build_info()
         super().run()
 
 
 class custom_build_info(build_py):
-
     def run(self):
         gen_build_info()
         super().run()
@@ -215,9 +196,8 @@ class build_and_install_aclnn(Command):
     def run(self):
         try:
             print("Running bash build_aclnn.sh ...")
-            subprocess.check_call(
-                ["bash", "csrc/build_aclnn.sh", ROOT_DIR, envs.SOC_VERSION])
-            print("buid_aclnn.sh executed successfully!")
+            subprocess.check_call(["bash", "csrc/build_aclnn.sh", ROOT_DIR, envs.SOC_VERSION])
+            print("build_aclnn.sh executed successfully!")
         except subprocess.CalledProcessError as e:
             print(f"Error running build_aclnn.sh: {e}")
             raise SystemExit(e.returncode)
@@ -225,7 +205,7 @@ class build_and_install_aclnn(Command):
 
 class cmake_build_ext(build_ext):
     # A dict of extension directories that have been configured.
-    did_config: Dict[str, bool] = {}
+    did_config: dict[str, bool] = {}
 
     #
     # Determine number of compilation jobs
@@ -254,15 +234,14 @@ class cmake_build_ext(build_ext):
     def configure(self, ext: CMakeExtension) -> None:
         build_temp = self.build_temp
         os.makedirs(build_temp, exist_ok=True)
-        source_dir = os.path.abspath(ROOT_DIR)
         python_executable = sys.executable
         cmake_args = ["cmake"]
         # Default use release mode to compile the csrc code
         # Turbo now support compiled with Release, Debug and RelWithDebugInfo
         if envs.CMAKE_BUILD_TYPE is None or envs.CMAKE_BUILD_TYPE not in [
-                "Debug",
-                "Release",
-                "RelWithDebugInfo",
+            "Debug",
+            "Release",
+            "RelWithDebugInfo",
         ]:
             envs.CMAKE_BUILD_TYPE = "Release"
         cmake_args += [f"-DCMAKE_BUILD_TYPE={envs.CMAKE_BUILD_TYPE}"]
@@ -284,20 +263,18 @@ class cmake_build_ext(build_ext):
         )
 
         # find PYTHON_EXECUTABLE
-        check_or_set_default_env(cmake_args, "PYTHON_EXECUTABLE",
-                                 sys.executable)
+        check_or_set_default_env(cmake_args, "PYTHON_EXECUTABLE", sys.executable)
 
         # find PYTHON_INCLUDE_PATH
-        check_or_set_default_env(cmake_args, "PYTHON_INCLUDE_PATH",
-                                 get_paths()["include"])
+        check_or_set_default_env(cmake_args, "PYTHON_INCLUDE_PATH", get_paths()["include"])
 
         # ccache and ninja can not be applied at ascendc kernels now
 
         try:
             # if pybind11 is installed via pip
-            pybind11_cmake_path = (subprocess.check_output(
-                [python_executable, "-m", "pybind11",
-                 "--cmakedir"]).decode().strip())
+            pybind11_cmake_path = (
+                subprocess.check_output([python_executable, "-m", "pybind11", "--cmakedir"]).decode().strip()
+            )
         except subprocess.CalledProcessError as e:
             # else specify pybind11 path installed from source code on CI container
             raise RuntimeError(f"CMake configuration failed: {e}")
@@ -315,8 +292,7 @@ class cmake_build_ext(build_ext):
             "910c": "ascend910_9392",
             "310p": "ascend310p1",
         }
-        CANN_SOC_VERSION = soc_version_map.get(envs.SOC_VERSION,
-                                               envs.SOC_VERSION)
+        CANN_SOC_VERSION = soc_version_map.get(envs.SOC_VERSION, envs.SOC_VERSION)
         cmake_args += [f"-DSOC_VERSION={CANN_SOC_VERSION}"]
 
         # Override the base directory for FetchContent downloads to $ROOT/.deps
@@ -329,8 +305,7 @@ class cmake_build_ext(build_ext):
 
         torch_npu_command = "python3 -m pip show torch-npu | grep '^Location:' | awk '{print $2}'"
         try:
-            torch_npu_path = subprocess.check_output(
-                torch_npu_command, shell=True).decode().strip()
+            torch_npu_path = subprocess.check_output(torch_npu_command, shell=True).decode().strip()
             torch_npu_path += "/torch_npu"
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Retrieve torch version version failed: {e}")
@@ -338,23 +313,17 @@ class cmake_build_ext(build_ext):
         # add TORCH_NPU_PATH
         cmake_args += [f"-DTORCH_NPU_PATH={torch_npu_path}"]
 
-        build_tool = []
-        # TODO(ganyi): ninja and ccache support for ascend c auto codegen. now we can only use make build
-        # if which('ninja') is not None:
-        #     build_tool += ['-G', 'Ninja']
-        # Default build tool to whatever cmake picks.
+        # Pass VLLM_ASCEND_ENABLE_BATCH_MEMCPY to CMake if explicitly set.
+        # When unset (None), CMake will auto-detect from CANN headers.
+        if envs.VLLM_ASCEND_ENABLE_BATCH_MEMCPY is not None:
+            cmake_args += [f"-DVLLM_ASCEND_ENABLE_BATCH_MEMCPY={envs.VLLM_ASCEND_ENABLE_BATCH_MEMCPY}"]
 
-        cmake_args += [source_dir]
-        logging.info(f"cmake config command: {cmake_args}")
+        cmake_args += [ext.cmake_lists_dir]
+        logging.info("cmake config command: %s", cmake_args)
         try:
             subprocess.check_call(cmake_args, cwd=self.build_temp)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"CMake configuration failed: {e}")
-
-        subprocess.check_call(
-            ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
-            cwd=self.build_temp,
-        )
 
     def build_extensions(self) -> None:
         if not envs.COMPILE_CUSTOM_KERNELS:
@@ -407,36 +376,36 @@ class cmake_build_ext(build_ext):
         # copy back to build folder for editable build
         if isinstance(self.distribution.get_command_obj("develop"), develop):
             import shutil
+
             for root, _, files in os.walk(self.build_temp):
                 for file in files:
                     if file.endswith(".so"):
                         src_path = os.path.join(root, file)
-                        dst_path = os.path.join(self.build_lib, "vllm_ascend",
-                                                file)
+                        dst_path = os.path.join(self.build_lib, "vllm_ascend", file)
                         shutil.copy(src_path, dst_path)
                         print(f"Copy: {src_path} -> {dst_path}")
 
         # copy back _cann_ops_custom directory
-        src_cann_ops_custom = os.path.join(ROOT_DIR, "vllm_ascend",
-                                           "_cann_ops_custom")
-        dst_cann_ops_custom = os.path.join(self.build_lib, "vllm_ascend",
-                                           "_cann_ops_custom")
+        src_cann_ops_custom = os.path.join(ROOT_DIR, "vllm_ascend", "_cann_ops_custom")
+        dst_cann_ops_custom = os.path.join(self.build_lib, "vllm_ascend", "_cann_ops_custom")
         if os.path.exists(src_cann_ops_custom):
             import shutil
+
             if os.path.exists(dst_cann_ops_custom):
                 shutil.rmtree(dst_cann_ops_custom)
             shutil.copytree(src_cann_ops_custom, dst_cann_ops_custom)
             print(f"Copy: {src_cann_ops_custom} -> {dst_cann_ops_custom}")
 
     def run(self):
-        # First, ensure ACLNN custom-ops is built and installed.
-        self.run_command("build_aclnn")
+        if envs.COMPILE_CUSTOM_KERNELS:
+            # First, ensure ACLNN custom-ops is built and installed.
+            self.run_command("build_aclnn")
+
         # Then, run the standard build_ext command to compile the extensions
         super().run()
 
 
 class custom_install(install):
-
     def run(self):
         self.run_command("build_ext")
         install.run(self)
@@ -469,10 +438,10 @@ def read_readme() -> str:
         return ""
 
 
-def get_requirements() -> List[str]:
+def get_requirements() -> list[str]:
     """Get Python package dependencies from requirements.txt."""
 
-    def _read_requirements(filename: str) -> List[str]:
+    def _read_requirements(filename: str) -> list[str]:
         with open(get_path(filename)) as f:
             requirements = f.read().strip().split("\n")
         resolved_requirements = []
@@ -497,7 +466,7 @@ cmdclass = {
     "build_py": custom_build_info,
     "build_aclnn": build_and_install_aclnn,
     "build_ext": cmake_build_ext,
-    "install": custom_install
+    "install": custom_install,
 }
 
 setup(
@@ -514,10 +483,10 @@ setup(
     project_urls={
         "Homepage": "https://github.com/vllm-project/vllm-ascend",
     },
-    # TODO: Add 3.12 back when torch-npu support 3.12
     classifiers=[
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "License :: OSI Approved :: Apache Software License",
         "Intended Audience :: Developers",
         "Intended Audience :: Information Technology",
@@ -526,6 +495,9 @@ setup(
         "Topic :: Scientific/Engineering :: Information Analysis",
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
+    package_data={
+        "vllm_ascend.observability": ["config/*.yaml"],
+    },
     python_requires=">=3.10",
     install_requires=get_requirements(),
     ext_modules=ext_modules,
@@ -536,7 +508,11 @@ setup(
         "vllm.general_plugins": [
             "ascend_kv_connector = vllm_ascend:register_connector",
             "ascend_model_loader = vllm_ascend:register_model_loader",
-            "ascend_service_profiling = vllm_ascend:register_service_profiling"
+            "ascend_service_profiling = vllm_ascend:register_service_profiling",
+            "ascend_model = vllm_ascend:register_model",
+        ],
+        "ms_service_metric.providers": [
+            "vllm-ascend = vllm_ascend.observability:get_metric_provider",
         ],
     },
 )

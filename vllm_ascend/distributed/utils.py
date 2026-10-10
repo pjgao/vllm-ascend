@@ -1,61 +1,55 @@
-import os
-
 import torch
 import torch.distributed as dist
-
-from vllm_ascend.distributed.parallel_state import get_p_tp_group
-
-
-def kv_alltoall_and_rearrange(pd_tp_ratio: int, key: torch.Tensor,
-                              value: torch.TensorType):
-    if pd_tp_ratio <= 1:
-        return None, None
-    elif key is None or value is None:
-        raise ValueError("key or value is None")
-    k_output = alltoall_and_rearrange(pd_tp_ratio, key)
-    v_output = alltoall_and_rearrange(pd_tp_ratio, value)
-    return k_output, v_output
+from vllm.distributed import get_dcp_group
+from vllm.distributed.parallel_state import GroupCoordinator
 
 
-def alltoall_and_rearrange(tp_ratio: int, input_tensor: torch.Tensor):
-    num_kv_heads = input_tensor.size(1)
-    output_tensor = torch.zeros_like(input_tensor)
-    dist.all_to_all_single(output_tensor,
-                           input_tensor,
-                           group=get_p_tp_group().device_group)
-    input_tensor = 0
-    result = rearrange_output(output_tensor, tp_ratio, num_kv_heads)
-    output_tensor = 0
-    return result
+def get_decode_context_model_parallel_world_size() -> int:
+    """Return DCP world size (v0.21.0 helper removed on vLLM main)."""
+    return get_dcp_group().world_size
 
 
-def rearrange_output(base_output: torch.Tensor, cut_num: int,
-                     num_kv_heads: int):
-    size_0 = base_output.size(0)
-    if size_0 % cut_num != 0:
-        raise ValueError(
-            f"The size of dim 0 [{size_0}] must be divisible by the cut_num [{cut_num}]"
-        )
-    chunk_size = size_0 // cut_num
-    reshaped = base_output.view(cut_num, chunk_size, -1)
-    transposed = reshaped.transpose(0, 1)
-    return transposed.contiguous().view(size_0, num_kv_heads, -1)
+def get_decode_context_model_parallel_rank() -> int:
+    """Return DCP rank within group (v0.21.0 helper removed on vLLM main)."""
+    return get_dcp_group().rank_in_group
 
 
-def align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
-    data_ptr = tensor.data_ptr()
-    aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
-    offset = (aligned_addr - data_ptr) // tensor.element_size()
-    return tensor[int(offset):]
+def all_gather_async(
+    input: torch.Tensor, group: GroupCoordinator, output: torch.Tensor | None = None, async_op: bool = True
+):
+    if group.world_size == 1:
+        return input, None
+    if output is None:
+        input_size = input.size()
+        output_size = (input_size[0] * group.world_size,) + input_size[1:]
+        output = torch.empty(output_size, dtype=input.dtype, device=input.device)
+    return output, dist.all_gather_into_tensor(output, input, group=group.device_group, async_op=async_op)
 
 
-def get_transfer_timeout_value():
-    ascend_transfer_timeout = os.getenv("ASCEND_TRANSFER_TIMEOUT", "")
-    if len(ascend_transfer_timeout) > 0:
-        return int(ascend_transfer_timeout)
-    hccl_rdma_timeout = int(os.getenv('HCCL_RDMA_TIMEOUT',
-                                      '20'))  # type: ignore
-    hccl_rdma_retry_cnt = int(os.getenv('HCCL_RDMA_RETRY_CNT',
-                                        '7'))  # type: ignore
-    return int((4.096 * (2**hccl_rdma_timeout)) * hccl_rdma_retry_cnt // 1000 +
-               3000)
+def split_tensor_along_first_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+):
+    """Split a tensor along its first dimension.
+
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                in memory.
+
+    Returns:
+        A list of Tensors
+    """
+    from vllm.distributed.utils import divide
+
+    # Get the size and dimension.
+    first_dim_size = divide(tensor.size()[0], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, first_dim_size, dim=0)
+    # NOTE: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list

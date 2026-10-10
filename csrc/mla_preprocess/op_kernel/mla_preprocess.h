@@ -49,7 +49,6 @@ constexpr uint8_t CACHE_MODE_INT8_NZCACHE = 2;  // high performance KV NZ format
 constexpr uint8_t CACHE_MODE_NZCACHE = 3;
 
 // pp matmul
-constexpr uint32_t HIDDTEN_STATE = 7168;
 constexpr uint32_t FLOAT_BLOCK_SIZE = 64;
 constexpr uint32_t HALF_BLOCK_SIZE = 64;
 constexpr uint32_t HALF_VECTOR_SIZE = 64;
@@ -60,9 +59,6 @@ constexpr uint32_t SPLIT_RMSNRORM_SIZE_ONE = 512;
 constexpr uint32_t SPLIT_RMSNRORM_SIZE_TWO = 64;
 constexpr uint32_t ROPE_SPLIT_SIZE_ONE = 64;
 constexpr uint32_t ROPE_SPLIT_SIZE_TWO = 128;
-
-constexpr uint32_t MMSIZE1 = 128 * 192;  // 24576
-constexpr uint32_t MMSIZE2 = 64 * 128;   // 8192
 
 constexpr uint64_t L0_PINGPONG_BUFFER_LEN = 32768;   // 32 KB
 constexpr uint64_t L1_PINGPONG_BUFFER_LEN = 262144;  // 256 KB
@@ -103,6 +99,18 @@ constexpr uint32_t KEY_FP16_CACHEMODE_1_QUANTMODE_0 = 1;
 constexpr uint32_t KEY_BF16_CACHEMODE_0_QUANTMODE_0 = 256;
 constexpr uint32_t KEY_BF16_CACHEMODE_1_QUANTMODE_0 = 257;
 constexpr uint32_t KEY_BF16_CACHEMODE_3_QUANTMODE_0 = 259;
+constexpr uint32_t KEY_BF16_CACHEMODE_0_QUANTMODE_1 = 264;  // bf16 | cm0 | (PER_TOKEN_SYMM<<3)
+constexpr uint32_t KEY_BF16_CACHEMODE_1_QUANTMODE_1 = 265;  // bf16 | cm1 | (PER_TOKEN_SYMM<<3)
+constexpr uint32_t KEY_BF16_CACHEMODE_2_QUANTMODE_1 = 266;  // bf16 | cm2 | (PER_TOKEN_SYMM<<3)
+constexpr uint32_t KEY_BF16_CACHEMODE_3_QUANTMODE_1 = 267;  // bf16 | cm3 | (PER_TOKEN_SYMM<<3)
+constexpr uint32_t KEY_BF16_CACHEMODE_1_QUANTMODE_3 = 281;
+constexpr uint32_t KEY_BF16_CACHEMODE_0_QUANTMODE_0_INNER = 256 + 512;
+constexpr uint32_t KEY_BF16_CACHEMODE_1_QUANTMODE_0_INNER = 257 + 512;
+constexpr uint32_t KEY_BF16_CACHEMODE_3_QUANTMODE_0_INNER = 259 + 512;
+constexpr uint32_t KEY_BF16_CACHEMODE_0_QUANTMODE_1_INNER = 264 + 512;
+constexpr uint32_t KEY_BF16_CACHEMODE_1_QUANTMODE_1_INNER = 265 + 512;
+constexpr uint32_t KEY_BF16_CACHEMODE_2_QUANTMODE_1_INNER = 266 + 512;
+constexpr uint32_t KEY_BF16_CACHEMODE_3_QUANTMODE_1_INNER = 267 + 512;
 
 enum class QuantMode : int32_t {
     PER_TENSOR_ASYMM_QUANT = 0,

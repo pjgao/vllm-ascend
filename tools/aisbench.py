@@ -18,67 +18,89 @@ import hashlib
 import json
 import logging
 import os
-import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import filelock
 import huggingface_hub
 import pandas as pd
+import regex as re
 from modelscope import snapshot_download  # type: ignore
 
-BENCHMARK_HOME = os.getenv("BENCHMARK_HOME", os.path.abspath("."))
-DATASET_CONF_DIR = os.path.join(BENCHMARK_HOME, "ais_bench", "benchmark",
-                                "configs", "datasets")
-REQUEST_CONF_DIR = os.path.join(BENCHMARK_HOME, "ais_bench", "benchmark",
-                                "configs", "models", "vllm_api")
+BENCHMARK_HOME = os.getenv("BENCHMARK_HOME", os.path.abspath("./benchmark"))
+DATASET_CONF_DIR = os.path.join(BENCHMARK_HOME, "ais_bench", "benchmark", "configs", "datasets")
+REQUEST_CONF_DIR = os.path.join(BENCHMARK_HOME, "ais_bench", "benchmark", "configs", "models", "vllm_api")
 DATASET_DIR = os.path.join(BENCHMARK_HOME, "ais_bench", "datasets")
 
 
 class AisbenchRunner:
     RESULT_MSG = {
-        "performance": "Performance Result files locate in ",
-        "accuracy": "write csv to "
+        "performance": "Performance Result files located in ",
+        "accuracy": "write csv to ",
+        "spec_decode": "write csv to ",
     }
     DATASET_RENAME = {
         "aime2024": "aime",
         "gsm8k-lite": "gsm8k",
-        "textvqa-lite": "textvqa"
+        "textvqa-lite": "textvqa",
+        "longbenchv2": "longbenchv2",
     }
 
     def _run_aisbench_task(self):
-        dataset_conf = self.dataset_conf.split('/')[-1]
-        if self.task_type == "accuracy":
-            aisbench_cmd = [
-                'ais_bench', '--models', f'{self.request_conf}_custom',
-                '--datasets', f'{dataset_conf}'
-            ]
+        dataset_conf = self.dataset_conf.split("/")[-1]
+        if self.task_type in ("accuracy", "spec_decode"):
+            aisbench_cmd = ["ais_bench", "--models", f"{self.request_conf}_custom", "--datasets", f"{dataset_conf}"]
         if self.task_type == "performance":
             aisbench_cmd = [
-                'ais_bench', '--models', f'{self.request_conf}_custom',
-                '--datasets', f'{dataset_conf}_custom', '--mode', 'perf'
+                "ais_bench",
+                "--models",
+                f"{self.request_conf}_custom",
+                "--datasets",
+                f"{dataset_conf}_custom",
+                "--mode",
+                "perf",
             ]
-            if self.num_prompts:
-                aisbench_cmd.extend(['--num-prompts', str(self.num_prompts)])
-        print(f"running aisbench cmd: {' '.join(aisbench_cmd)}")
-        self.proc: subprocess.Popen = subprocess.Popen(aisbench_cmd,
-                                                       stdout=subprocess.PIPE,
-                                                       stderr=subprocess.PIPE,
-                                                       text=True)
+        if self.num_prompts:
+            aisbench_cmd.extend(["--num-prompts", str(self.num_prompts)])
+        self.stdout_file = f"output_{self.task_type}.txt"
+        aisbench_cmd = " ".join(aisbench_cmd) + f" --debug > {self.stdout_file} 2>&1 &"
+        print(f"running aisbench cmd: {aisbench_cmd}")
+        self.proc: subprocess.Popen = subprocess.Popen(aisbench_cmd, shell=True)
 
-    def __init__(self,
-                 model: str,
-                 port: int,
-                 aisbench_config: dict,
-                 host_ip: str = "localhost",
-                 verify=True):
+    def __init__(self, model: str, port: int, aisbench_config: dict, host_ip: str = "localhost", verify=True):
         self.model = model
-        self.dataset_path = maybe_download_from_modelscope(
-            aisbench_config["dataset_path"], repo_type="dataset")
-        self.model_path = maybe_download_from_modelscope(model)
-        assert self.dataset_path is not None and self.model_path is not None, \
+        self.port = port
+        self.host_ip = host_ip
+        self.proc = None
+        self.task_type = aisbench_config["case_type"]
+        self.exp_folder = None
+        self.result_line = None
+        if self.task_type == "curl_cmd":
+            cmds = aisbench_config.get("cmds", [])
+            print(f"[INFO] Running custom curl commands for task: {self.task_type}")
+            for cmd in cmds:
+                formatted_cmd = cmd.replace("${SERVER_PORT}", str(self.port)).replace("$SERVER_PORT", str(self.port))
+                print(f"Executing: {formatted_cmd}")
+                try:
+                    res = subprocess.run(formatted_cmd, shell=True, check=True, capture_output=True, text=True)
+                    if res.stdout:
+                        print(f"Response: {res.stdout.strip()}")
+                except subprocess.CalledProcessError as e:
+                    print(f"Failed to execute cmd: {formatted_cmd}\nError: {e.stderr}")
+                    raise e
+            self.result = "SUCCESS"
+            return
+        self.dataset_path = aisbench_config.get("dataset_path_local")
+        if not self.dataset_path:
+            self.dataset_path = maybe_download_from_modelscope(aisbench_config["dataset_path"], repo_type="dataset")
+        self.model_path = aisbench_config.get("model_path")
+        if not self.model_path:
+            self.model_path = maybe_download_from_modelscope(model)
+        assert self.dataset_path is not None and self.model_path is not None, (
             f"Failed to download dataset or model: dataset={self.dataset_path}, model={self.model_path}"
+        )
         self.port = port
         self.host_ip = host_ip
         self.task_type = aisbench_config["case_type"]
@@ -88,15 +110,30 @@ class AisbenchRunner:
         self.max_out_len = aisbench_config["max_out_len"]
         self.batch_size = aisbench_config["batch_size"]
         self.request_rate = aisbench_config.get("request_rate", 0)
+        self.trust_remote_code = aisbench_config.get("trust_remote_code", True)
         self.temperature = aisbench_config.get("temperature")
         self.top_k = aisbench_config.get("top_k")
         self.top_p = aisbench_config.get("top_p")
         self.seed = aisbench_config.get("seed")
+        self.min_p = aisbench_config.get("min_p")
+        self.presence_penalty = aisbench_config.get("presence_penalty")
         self.repetition_penalty = aisbench_config.get("repetition_penalty")
+        self.no_pred = aisbench_config.get("no_pred")
+        self.thinking = aisbench_config.get("thinking")
+        self.reasoning_effort = aisbench_config.get("reasoning_effort")
+        self.input_throughput_threshold = aisbench_config.get("input_throughput_threshold")
+        self.tpot_threshold = aisbench_config.get("tpot_threshold")
+        self.spec_decode_baseline = aisbench_config.get("baseline", [])
         self.exp_folder = None
         self.result_line = None
         self._init_dataset_conf()
         self._init_request_conf()
+        if self.task_type == "spec_decode":
+            assert self.spec_decode_baseline, "spec_decode baseline must contain a rate for every position"
+            from tools.spec_decode_metrics import capture_baseline
+
+            self.metrics_server = _MetricsServer(self.host_ip, self.port)
+            self.metrics_baseline = capture_baseline(self.metrics_server, len(self.spec_decode_baseline))
         self._run_aisbench_task()
         self._wait_for_task()
         if verify:
@@ -107,71 +144,78 @@ class AisbenchRunner:
             if self.task_type == "performance":
                 self.threshold = aisbench_config.get("threshold", 0.97)
                 self._performance_verify()
+            if self.task_type == "spec_decode":
+                self.threshold = aisbench_config.get("threshold", 0.05)
+                self._spec_decode_verify()
 
     def _init_dataset_conf(self):
-        if self.task_type == "accuracy":
+        if self.task_type in ("accuracy", "spec_decode"):
             dataset_name = os.path.basename(self.dataset_path)
-            dataset_rename = self.DATASET_RENAME.get(dataset_name, "")
+            dataset_rename = self.DATASET_RENAME.get(dataset_name, dataset_name)
             dst_dir = os.path.join(DATASET_DIR, dataset_rename)
             command = ["cp", "-r", self.dataset_path, dst_dir]
             subprocess.call(command)
         if self.task_type == "performance":
-            conf_path = os.path.join(DATASET_CONF_DIR,
-                                     f'{self.dataset_conf}.py')
+            conf_path = os.path.join(DATASET_CONF_DIR, f"{self.dataset_conf}.py")
             if self.dataset_conf.startswith("textvqa"):
-                self.dataset_path = os.path.join(self.dataset_path,
-                                                 "textvqa_val.jsonl")
-            with open(conf_path, 'r', encoding='utf-8') as f:
+                self.dataset_path = os.path.join(self.dataset_path, "textvqa_val.jsonl")
+            with open(conf_path, encoding="utf-8") as f:
                 content = f.read()
-            content = re.sub(r'path=.*', f'path="{self.dataset_path}",',
-                             content)
-            conf_path_new = os.path.join(DATASET_CONF_DIR,
-                                         f'{self.dataset_conf}_custom.py')
-            with open(conf_path_new, 'w', encoding='utf-8') as f:
+            content = re.sub(r"path=.*", f'path="{self.dataset_path}",', content)
+            conf_path_new = os.path.join(DATASET_CONF_DIR, f"{self.dataset_conf}_custom.py")
+            with open(conf_path_new, "w", encoding="utf-8") as f:
                 f.write(content)
 
     def _init_request_conf(self):
-        conf_path = os.path.join(REQUEST_CONF_DIR, f'{self.request_conf}.py')
-        with open(conf_path, 'r', encoding='utf-8') as f:
+        conf_path = os.path.join(REQUEST_CONF_DIR, f"{self.request_conf}.py")
+        with open(conf_path, encoding="utf-8") as f:
             content = f.read()
-        content = re.sub(r'model=.*', f'model="{self.model}",', content)
-        content = re.sub(r'host_port.*', f'host_port = {self.port},', content)
-        content = re.sub(r'host_ip.*', f'host_ip = "{self.host_ip}",', content)
-        content = re.sub(r'max_out_len.*',
-                         f'max_out_len = {self.max_out_len},', content)
-        content = re.sub(r'batch_size.*', f'batch_size = {self.batch_size},',
-                         content)
-        content = content.replace("top_k", "#top_k")
-        content = content.replace("seed", "#seed")
-        content = content.replace("repetition_penalty", "#repetition_penalty")
-        if self.task_type == "performance":
-            content = re.sub(r'path=.*', f'path="{self.model_path}",', content)
-            content = re.sub(r'request_rate.*',
-                             f'request_rate = {self.request_rate},', content)
-            content = re.sub(
-                r"temperature.*",
-                "temperature = 0,\n            ignore_eos = True,", content)
-            content = content.replace("top_p", "#top_p")
-        if self.task_type == "accuracy":
-            content = re.sub(
-                r"temperature.*",
-                "temperature = 0.6,\n            ignore_eos = False,", content)
-        if self.temperature:
-            content = re.sub(r"temperature.*",
-                             f"temperature = {self.temperature},", content)
+        content = re.sub(r"model=.*", f'model="{self.model}",', content)
+        content = re.sub(r"host_port.*", f"host_port={self.port},", content)
+        content = re.sub(r"host_ip.*", f'host_ip="{self.host_ip}",', content)
+        content = re.sub(r"max_out_len.*", f"max_out_len={self.max_out_len},", content)
+        content = re.sub(r"batch_size.*", f"batch_size={self.batch_size},", content)
+        content = re.sub(r"trust_remote_code=.*", f"trust_remote_code={self.trust_remote_code},", content)
         if self.top_p:
-            content = re.sub(r"#?top_p.*", f"top_p = {self.top_p},", content)
+            content = re.sub(r"ignore_eos.*", f"ignore_eos=False,\n            top_p={self.top_p},", content)
         if self.top_k:
-            content = re.sub(r"#top_k.*", f"top_k = {self.top_k},", content)
+            content = re.sub(r"ignore_eos.*", f"ignore_eos=False,\n            top_k={self.top_k},", content)
         if self.seed:
-            content = re.sub(r"#seed.*", f"seed = {self.seed},", content)
+            content = re.sub(r"ignore_eos.*", f"ignore_eos=False,\n            seed={self.seed},", content)
+        if self.min_p:
+            content = re.sub(r"ignore_eos.*", f"ignore_eos=False,\n            min_p={self.min_p},", content)
+        if self.presence_penalty:
+            content = re.sub(
+                r"ignore_eos.*", f"ignore_eos=False,\n            presence_penalty={self.presence_penalty},", content
+            )
         if self.repetition_penalty:
             content = re.sub(
-                r"#repetition_penalty.*",
-                f"repetition_penalty = {self.repetition_penalty},", content)
-        conf_path_new = os.path.join(REQUEST_CONF_DIR,
-                                     f'{self.request_conf}_custom.py')
-        with open(conf_path_new, 'w', encoding='utf-8') as f:
+                r"ignore_eos.*",
+                f"ignore_eos=False,\n            repetition_penalty={self.repetition_penalty},",
+                content,
+            )
+        if self.thinking:
+            field_thinking = 'chat_template_kwargs={"thinking": True}'
+            content = re.sub(r"ignore_eos.*", f"ignore_eos=False,\n            {field_thinking},", content)
+        if self.reasoning_effort is not None:
+            content = re.sub(
+                r"ignore_eos.*",
+                f'ignore_eos=False,\n            reasoning_effort="{self.reasoning_effort}",',
+                content,
+            )
+        if self.task_type == "performance":
+            content = re.sub(r"path=.*", f'path="{self.model_path}",', content)
+            content = re.sub(r"request_rate.*", f"request_rate={self.request_rate},", content)
+            content = re.sub(r"temperature.*", "temperature=0,", content)
+            content = re.sub(r"ignore_eos.*", "ignore_eos=True,", content)
+        if self.task_type in ("accuracy", "spec_decode"):
+            content = re.sub(r"temperature.*", "temperature=0.6,", content)
+        if self.temperature is not None:
+            content = re.sub(r"temperature.*", f"temperature={self.temperature},", content)
+        if self.no_pred:
+            content = re.sub(r"pred_postprocessor.*", "#pred_postprocessor", content)
+        conf_path_new = os.path.join(REQUEST_CONF_DIR, f"{self.request_conf}_custom.py")
+        with open(conf_path_new, "w", encoding="utf-8") as f:
             f.write(content)
         print(f"The request config is\n {content}")
 
@@ -179,90 +223,144 @@ class AisbenchRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.proc.terminate()
-        try:
-            self.proc.wait(8)
-        except subprocess.TimeoutExpired:
-            # force kill if needed
-            self.proc.kill()
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(8)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
     def _wait_for_exp_folder(self):
         while True:
-            line = self.proc.stdout.readline().strip()
-            print(line)
+            line = self._check_runtime_stdout()
             if "Current exp folder: " in line:
-                self.exp_folder = re.search(r'Current exp folder: (.*)',
-                                            line).group(1)
+                self.exp_folder = re.search(r"Current exp folder: (.*)", line).group(1)
+                print(f"Current exp folder: {self.exp_folder}")
                 return
-            if "ERROR" in line:
-                error_msg = f"Some errors happened to Aisbench runtime, the first error is {line}"
-                raise RuntimeError(error_msg) from None
+            self._check_runtime_error(line)
 
     def _wait_for_task(self):
         self._wait_for_exp_folder()
         result_msg = self.RESULT_MSG[self.task_type]
         while True:
-            line = self.proc.stdout.readline().strip()
-            print(line)
+            line = self._check_runtime_stdout()
             if result_msg in line:
+                print(line)
                 self.result_line = line
                 return
-            if "ERROR" in line:
-                error_msg = f"Some errors happened to Aisbench runtime, the first error is {line}"
-                raise RuntimeError(error_msg) from None
+            self._check_runtime_error(line)
+
+    def _check_runtime_stdout(self):
+        time.sleep(5)
+        cmd = f"tail -100 {self.stdout_file}"
+        return subprocess.check_output(cmd, shell=True).decode()
+
+    @staticmethod
+    def _check_runtime_error(line):
+        if "ERROR" in line:
+            print(line)
+            error_msg = "Some errors happened to Aisbench runtime"
+            raise RuntimeError(error_msg) from None
 
     def _get_result_performance(self):
-        result_dir = re.search(r'Performance Result files locate in (.*)',
-                               self.result_line).group(1)[:-1]
-        dataset_type = self.dataset_conf.split('/')[0]
-        result_csv_file = os.path.join(result_dir,
-                                       f"{dataset_type}dataset.csv")
-        result_json_file = os.path.join(result_dir,
-                                        f"{dataset_type}dataset.json")
+        result_dir = re.search(r"Performance Result files located in (.*)", self.result_line).group(1)[:-1]
+        dataset_type = self.dataset_conf.split("/")[0]
+        result_csv_file = os.path.join(result_dir, f"{dataset_type}.csv")
+        result_json_file = os.path.join(result_dir, f"{dataset_type}.json")
         self.result_csv = pd.read_csv(result_csv_file, index_col=0)
         print("Getting performance results from file: ", result_json_file)
-        with open(result_json_file, 'r', encoding='utf-8') as f:
+        with open(result_json_file, encoding="utf-8") as f:
             self.result_json = json.load(f)
         self.result = [self.result_csv, self.result_json]
 
     def _get_result_accuracy(self):
-        acc_file = re.search(r'write csv to (.*)', self.result_line).group(1)
+        acc_file = re.search(r"write csv to (.*)", self.result_line).group(1)
         df = pd.read_csv(acc_file)
-        self.result = float(df.loc[0][-1])
+        self.result = float(df.iloc[0, -1])
+
+        if "longbenchv2" in str(self.dataset_conf):
+            self.result = float(df["accuracy"].mean())
+        else:
+            self.result = float(df.iloc[0, -1])
 
     def _performance_verify(self):
         self._get_result_performance()
-        output_throughput = self.result_json["Output Token Throughput"][
-            "total"].replace("token/s", "")
-        assert float(
-            output_throughput
-        ) >= self.threshold * self.baseline, f"Performance verification failed. The current Output Token Throughput is {output_throughput} token/s, which is not greater than or equal to {self.threshold} * baseline {self.baseline}."
+        output_throughput = self.result_json["Output Token Throughput"]["total"].replace("token/s", "")
+        assert float(output_throughput) >= self.threshold * self.baseline, (
+            "Performance verification failed. "
+            f"The current Output Token Throughput is {output_throughput} token/s, "
+            f"which is not greater than or equal to {self.threshold} * baseline {self.baseline}."
+        )
+        if self.input_throughput_threshold is not None:
+            input_throughput = str(self.result_json["Input Token Throughput"]["total"]).replace("token/s", "")
+            assert float(input_throughput) >= float(self.input_throughput_threshold), (
+                f"Input Token Throughput verification failed. The current value is {input_throughput} token/s, "
+                f"which is not greater than {self.input_throughput_threshold} token/s."
+            )
+        if self.tpot_threshold is not None:
+            tpot = float(str(self.result_csv.loc["TPOT", "Average"]).replace("ms", ""))
+            assert tpot <= float(self.tpot_threshold), (
+                f"TPOT verification failed. The current TPOT is {tpot} ms, "
+                f"which is greater than {self.tpot_threshold} ms."
+            )
 
     def _accuracy_verify(self):
         self._get_result_accuracy()
         acc_value = self.result
-        assert self.baseline - self.threshold <= acc_value <= self.baseline + self.threshold, f"Accuracy verification failed. The accuracy of {self.dataset_path} is {acc_value}, which is not within {self.threshold} relative to baseline {self.baseline}."
+        assert self.baseline - self.threshold <= acc_value <= self.baseline + self.threshold, (
+            "Accuracy verification failed. "
+            f"The accuracy of {self.dataset_path} is {acc_value}, "
+            f"which is not within {self.threshold} relative to baseline {self.baseline}."
+        )
+
+    def _spec_decode_verify(self):
+        from tools.spec_decode_metrics import (
+            measure_acceptance_rate,
+            validate_acceptance_rates,
+        )
+
+        _, self.result = measure_acceptance_rate(
+            self.metrics_server,
+            len(self.spec_decode_baseline),
+            self.metrics_baseline,
+        )
+        validate_acceptance_rates(self.result, self.spec_decode_baseline, self.threshold)
 
 
-def run_aisbench_cases(model,
-                       port,
-                       aisbench_cases,
-                       server_args="",
-                       host_ip="localhost"):
+class _MetricsServer:
+    """Minimal URL adapter used by the shared speculative-decoding metrics helpers."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+
+    def url_for(self, *parts: str) -> str:
+        path = "/".join(part.strip("/") for part in parts)
+        return f"http://{self.host}:{self.port}/{path}"
+
+
+def run_aisbench_cases(model, port, aisbench_cases, server_args="", host_ip="localhost"):
     aisbench_results = []
     aisbench_errors = []
+    total = sum(1 for c in aisbench_cases if c)
+    idx = 0
     for aisbench_case in aisbench_cases:
         if not aisbench_case:
             continue
+        idx += 1
+        case_name = aisbench_case.get("case_name", "unknown")
+        case_type = aisbench_case.get("case_type", "unknown")
+        logging.info("=" * 60)
+        logging.info("[%d/%d] Starting benchmark: %s (type=%s)", idx, total, case_name, case_type)
+        logging.info("=" * 60)
         try:
-            with AisbenchRunner(model=model,
-                                port=port,
-                                host_ip=host_ip,
-                                aisbench_config=aisbench_case) as aisbench:
+            with AisbenchRunner(model=model, port=port, host_ip=host_ip, aisbench_config=aisbench_case) as aisbench:
                 aisbench_results.append(aisbench.result)
+            logging.info("[%d/%d] Finished benchmark: %s", idx, total, case_name)
         except Exception as e:
             aisbench_results.append("")
             aisbench_errors.append([aisbench_case, e])
+            logging.error("[%d/%d] Benchmark failed: %s, reason: %s", idx, total, case_name, e)
             print(e)
     for failed_case, error_info in aisbench_errors:
         error_msg = f"The following aisbench case failed: {failed_case}, reason is {error_info}"
@@ -273,9 +371,11 @@ def run_aisbench_cases(model,
     return aisbench_results
 
 
-def get_TTFT(result):
-    TTFT = result[0][0].loc["TTFT", "Average"][:-3]
-    return float(TTFT)
+def get_TTFT(results):
+    TTFT = []
+    for i in range(len(results)):
+        TTFT.append(float(results[i][0].loc["TTFT", "Average"][:-3]))
+    return TTFT
 
 
 temp_dir = tempfile.gettempdir()
@@ -290,8 +390,7 @@ def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name),
-                             mode=0o666)
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
 
 
